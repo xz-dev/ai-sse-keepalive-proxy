@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -54,6 +55,67 @@ func readAll(t *testing.T, resp *http.Response) string {
 		t.Fatal(err)
 	}
 	return string(body)
+}
+
+func TestEligibleClientIsFixedUpstream(t *testing.T) {
+	var proxyHits atomic.Int32
+	poisonedProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyHits.Add(1)
+		http.Error(w, "proxy used", http.StatusBadGateway)
+	}))
+	defer poisonedProxy.Close()
+	t.Setenv("HTTP_PROXY", poisonedProxy.URL)
+	t.Setenv("HTTPS_PROXY", poisonedProxy.URL)
+	t.Setenv("NO_PROXY", "")
+
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: ok\n\n")
+	}))
+	defer upstream.Close()
+	u, _ := url.Parse(upstream.URL)
+	p := newProxy(config{upstream: u, wait: time.Second, idle: time.Second, maxBody: defaultMaxBody})
+	transport, ok := p.client.Transport.(*http.Transport)
+	if !ok || transport.Proxy != nil || !transport.DisableCompression {
+		t.Fatalf("transport=%T proxyDisabled=%v disableCompression=%v", p.client.Transport, transport.Proxy == nil, transport.DisableCompression)
+	}
+	front := httptest.NewServer(p)
+	defer front.Close()
+
+	resp := request(t, http.DefaultClient, http.MethodPost, front.URL+"/v1/responses", "application/json", `{"stream":true}`)
+	if resp.StatusCode != http.StatusOK || readAll(t, resp) != "data: ok\n\n" {
+		t.Fatal("eligible request failed")
+	}
+	if upstreamHits.Load() != 1 || proxyHits.Load() != 0 {
+		t.Fatalf("upstream hits=%d proxy hits=%d", upstreamHits.Load(), proxyHits.Load())
+	}
+}
+
+func TestEligibleRedirectIsReturnedWithoutFollowing(t *testing.T) {
+	var targetHits atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetHits.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+
+	p, _ := testProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", target.URL+"/escaped")
+		w.Header().Set("X-Redirect", "kept")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+		_, _ = io.WriteString(w, "redirect body")
+	}), time.Second, time.Second, defaultMaxBody)
+	client := *http.DefaultClient
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp := request(t, &client, http.MethodPost, p.URL+"/v1/responses", "application/json", `{"stream":true}`)
+	if resp.StatusCode != http.StatusTemporaryRedirect || resp.Header.Get("X-Redirect") != "kept" || readAll(t, resp) != "redirect body" {
+		t.Fatal("redirect response not preserved")
+	}
+	if targetHits.Load() != 0 {
+		t.Fatalf("redirect target hits=%d", targetHits.Load())
+	}
 }
 
 func TestNonStreamTransparentAndFixedUpstream(t *testing.T) {
@@ -212,6 +274,185 @@ func TestFastInvalidResponsePreserved(t *testing.T) {
 	}
 }
 
+func TestServeWaitsForActiveHandler(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+		_, _ = io.WriteString(w, "done")
+	})}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- serve(ctx, srv, listener, time.Second) }()
+
+	response := make(chan *http.Response, 1)
+	go func() {
+		resp, _ := http.Get("http://" + listener.Addr().String())
+		response <- resp
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		t.Fatalf("serve returned while handler blocked: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("serve did not finish after handler release")
+	}
+	resp := <-response
+	if resp == nil || readAll(t, resp) != "done" {
+		t.Fatal("active response did not finish")
+	}
+}
+
+func TestTerminalEventsSuppressSyntheticFrames(t *testing.T) {
+	cases := []struct {
+		name      string
+		path      string
+		parts     []string
+		synthetic string
+	}{
+		{"responses", "/v1/responses", []string{"data: {\"type\":\"response.comp", "leted\"}\n\n", "data: trailing\n\n"}, "response.in_progress"},
+		{"chat", "/v1/chat/completions", []string{"data: [DO", "NE]\n\n", "data: trailing\n\n"}, "chatcmpl-keepalive"},
+		{"messages", "/v1/messages", []string{"event: message_", "stop\ndata: {\"type\":\"message_stop\"}\n\n", "data: trailing\n\n"}, "event: ping"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			release := make(chan struct{})
+			p, _ := testProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				for i, part := range tc.parts {
+					_, _ = io.WriteString(w, part)
+					w.(http.Flusher).Flush()
+					if i == 0 {
+						time.Sleep(time.Millisecond)
+					}
+				}
+				<-release
+			}), 100*time.Millisecond, 10*time.Millisecond, defaultMaxBody)
+			resp := request(t, http.DefaultClient, http.MethodPost, p.URL+tc.path, "application/json", `{"stream":true}`)
+			time.Sleep(35 * time.Millisecond)
+			close(release)
+			want := strings.Join(tc.parts, "")
+			if body := readAll(t, resp); body != want || strings.Contains(body, tc.synthetic) {
+				t.Fatalf("body=%q want=%q", body, want)
+			}
+		})
+	}
+}
+
+func TestTerminalEventsSuppressGenericErrors(t *testing.T) {
+	cases := []struct {
+		kind     streamKind
+		terminal string
+	}{
+		{streamResponses, "data: {\"type\":\"response.failed\"}\n\n"},
+		{streamChat, "data: [DONE]\n\n"},
+		{streamMessages, "data: {\"type\":\"message_stop\"}\n\n"},
+	}
+	for _, tc := range cases {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, "/", nil)
+		reads := make(chan readResult, 2)
+		reads <- readResult{data: []byte(tc.terminal)}
+		reads <- readResult{data: []byte("data: trailing\n\n"), err: errors.New("upstream broke")}
+		p := newProxy(config{idle: time.Second})
+		p.copySSEAfter(recorder, request, tc.kind, reads, time.Second, newTerminalDetector(tc.kind))
+		if got, want := recorder.Body.String(), tc.terminal+"data: trailing\n\n"; got != want {
+			t.Fatalf("kind=%d body=%q want=%q", tc.kind, got, want)
+		}
+	}
+}
+
+func TestTerminalDetectorBufferIsBounded(t *testing.T) {
+	detector := newTerminalDetector(streamResponses)
+	detector.Write(bytes.Repeat([]byte("x"), maxSSEEventSize+1))
+	if len(detector.buffer) > maxSSEEventSize {
+		t.Fatalf("buffer=%d", len(detector.buffer))
+	}
+}
+
+func TestStartupTimerConsumesReadyEOF(t *testing.T) {
+	p := newProxy(config{wait: time.Millisecond, idle: time.Second})
+	for range 100 {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		reads := make(chan readResult, 1)
+		reads <- readResult{err: io.EOF}
+		timer := time.NewTimer(0)
+		p.handleBeforeThresholdReads(recorder, request, streamResponses, reads, newTerminalDetector(streamResponses), &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}}}, timer)
+		if body := recorder.Body.String(); body != "" {
+			t.Fatalf("startup frame after ready EOF: %q", body)
+		}
+	}
+}
+
+func TestExactSyntheticFrames(t *testing.T) {
+	if got, want := string(keepaliveFrame(streamResponses, time.Unix(1, 0))), "data: {\"type\":\"response.in_progress\"}\n\n"; got != want {
+		t.Fatalf("responses keepalive=%q", got)
+	}
+	cases := []struct {
+		kind streamKind
+		want string
+	}{
+		{streamResponses, "data: {\"type\":\"error\",\"code\":null,\"message\":\"Upstream stream failed before completion.\",\"param\":null}\n\n"},
+		{streamChat, "data: {\"error\":{\"message\":\"Upstream stream failed before completion.\",\"type\":\"stream_error\"}}\n\n"},
+		{streamMessages, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Upstream stream failed before completion.\"}}\n\n"},
+	}
+	for _, tc := range cases {
+		if got := string(errorFrame(tc.kind)); got != tc.want {
+			t.Fatalf("kind=%d frame=%q want=%q", tc.kind, got, tc.want)
+		}
+	}
+}
+
+func TestCompressedSSEIsInvalid(t *testing.T) {
+	t.Run("fast response preserved", func(t *testing.T) {
+		p, _ := testProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Content-Encoding", "gzip")
+			w.Header().Set("X-Upstream", "kept")
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = io.WriteString(w, "compressed bytes")
+		}), time.Second, time.Second, defaultMaxBody)
+		client := &http.Client{Transport: &http.Transport{DisableCompression: true}}
+		resp := request(t, client, http.MethodPost, p.URL+"/v1/responses", "application/json", `{"stream":true}`)
+		if resp.StatusCode != http.StatusAccepted || resp.Header.Get("Content-Encoding") != "gzip" || resp.Header.Get("X-Upstream") != "kept" || readAll(t, resp) != "compressed bytes" {
+			t.Fatal("compressed fast response changed")
+		}
+	})
+
+	t.Run("slow response gets in-band error", func(t *testing.T) {
+		p, _ := testProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			time.Sleep(25 * time.Millisecond)
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Content-Encoding", "br")
+			_, _ = io.WriteString(w, "compressed bytes")
+		}), 5*time.Millisecond, time.Second, defaultMaxBody)
+		resp := request(t, http.DefaultClient, http.MethodPost, p.URL+"/v1/responses", "application/json", `{"stream":true}`)
+		body := readAll(t, resp)
+		if resp.StatusCode != http.StatusOK || !strings.HasSuffix(body, string(errorFrame(streamResponses))) || strings.Contains(body, "compressed bytes") {
+			t.Fatalf("status=%d body=%q", resp.StatusCode, body)
+		}
+	})
+}
+
 func TestEOFAndCancellationStop(t *testing.T) {
 	t.Run("EOF has no trailing heartbeat", func(t *testing.T) {
 		p, _ := testProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -325,6 +566,10 @@ func TestRouteParsersAndGate(t *testing.T) {
 	v6Default := []byte(strings.Repeat("0", 32) + " 00 " + strings.Repeat("0", 32) + " 00 " + strings.Repeat("0", 32) + " 00000000 00000000 00000001 00000003 eth0\n")
 	if !hasDefaultRoute(v4Default, nil) || !hasDefaultRoute(nil, v6Default) {
 		t.Fatal("default route not detected")
+	}
+	nonDefaultV4 := []byte("Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\neth0 00000000 0100000A 0003 0 0 0 000000FF 0 0 0\n")
+	if hasDefaultRoute(nonDefaultV4, nil) {
+		t.Fatal("0.0.0.0/8 must not be treated as default")
 	}
 	loopbackV6 := bytes.Replace(v6Default, []byte("eth0"), []byte("lo"), 1)
 	if hasDefaultRoute([]byte("Iface Destination\n"), loopbackV6) {

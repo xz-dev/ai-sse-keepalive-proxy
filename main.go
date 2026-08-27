@@ -23,7 +23,10 @@ import (
 	"time"
 )
 
-const defaultMaxBody = 16 << 20
+const (
+	defaultMaxBody  = 16 << 20
+	maxSSEEventSize = 64 << 10
+)
 
 type config struct {
 	upstream              *url.URL
@@ -74,18 +77,43 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			log.Printf("shutdown: %v", err)
-		}
-	}()
-	log.Printf("listening on %s", cfg.listen)
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	listener, err := net.Listen("tcp", cfg.listen)
+	if err != nil {
 		log.Fatal(err)
 	}
+	log.Printf("listening on %s", listener.Addr())
+	if err := serve(ctx, srv, listener, 10*time.Second); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func serve(ctx context.Context, srv *http.Server, listener net.Listener, shutdownTimeout time.Duration) error {
+	result := make(chan error, 1)
+	go func() { result <- srv.Serve(listener) }()
+
+	select {
+	case err := <-result:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	err := srv.Shutdown(shutdownCtx)
+	cancel()
+	if err != nil {
+		_ = srv.Close()
+	}
+	serveErr := <-result
+	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+		return serveErr
+	}
+	return nil
 }
 
 func healthcheck(listen string) error {
@@ -173,7 +201,7 @@ func waitForNoDefaultRoute(fsys fs.FS, timeout time.Duration) error {
 func hasDefaultRoute(v4, v6 []byte) bool {
 	for _, line := range strings.Split(string(v4), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) >= 4 && fields[1] == "00000000" && fields[3] != "0000" {
+		if len(fields) >= 8 && fields[1] == "00000000" && fields[7] == "00000000" && fields[3] != "0000" {
 			return true
 		}
 	}
@@ -220,7 +248,16 @@ func newProxy(cfg config) *proxy {
 			}
 		},
 	}
-	return &proxy{cfg: cfg, fallback: rp, client: &http.Client{Transport: http.DefaultTransport}}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.DisableCompression = true
+	client := &http.Client{
+		Transport: transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	return &proxy{cfg: cfg, fallback: rp, client: client}
 }
 
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -347,26 +384,42 @@ func (p *proxy) handleBeforeThreshold(w http.ResponseWriter, r *http.Request, ki
 	}
 
 	reads := streamReads(r.Context(), got.response.Body)
+	p.handleBeforeThresholdReads(w, r, kind, reads, newTerminalDetector(kind), got.response, timer)
+}
+
+func (p *proxy) handleBeforeThresholdReads(w http.ResponseWriter, r *http.Request, kind streamKind, reads <-chan readResult, detector *terminalDetector, resp *http.Response, timer *time.Timer) {
 	select {
 	case rr := <-reads:
-		copyHeader(w.Header(), got.response.Header)
-		w.Header().Del("Content-Length")
-		w.WriteHeader(got.response.StatusCode)
-		if len(rr.data) > 0 && !writeFrame(w, rr.data) {
-			return
-		}
-		if rr.err != nil {
-			if !errors.Is(rr.err, io.EOF) && r.Context().Err() == nil {
-				writeFrame(w, errorFrame(kind))
-			}
-			return
-		}
-		p.copySSE(w, r, kind, reads)
+		p.handleInitialRead(w, r, kind, reads, detector, resp, rr)
 	case <-timer.C:
-		p.openSlow(w, kind)
-		p.copySSE(w, r, kind, reads)
+		select {
+		case rr := <-reads:
+			p.handleInitialRead(w, r, kind, reads, detector, resp, rr)
+		default:
+			p.openSlow(w, kind)
+			p.copySSEAfter(w, r, kind, reads, p.cfg.idle, detector)
+		}
 	case <-r.Context().Done():
 	}
+}
+
+func (p *proxy) handleInitialRead(w http.ResponseWriter, r *http.Request, kind streamKind, reads <-chan readResult, detector *terminalDetector, resp *http.Response, rr readResult) {
+	copyHeader(w.Header(), resp.Header)
+	w.Header().Del("Content-Length")
+	w.WriteHeader(resp.StatusCode)
+	if len(rr.data) > 0 {
+		detector.Write(rr.data)
+		if !writeFrame(w, rr.data) {
+			return
+		}
+	}
+	if rr.err != nil {
+		if !errors.Is(rr.err, io.EOF) && r.Context().Err() == nil && !detector.terminal {
+			writeFrame(w, errorFrame(kind))
+		}
+		return
+	}
+	p.copySSEAfter(w, r, kind, reads, p.cfg.idle, detector)
 }
 
 func (p *proxy) openSlow(w http.ResponseWriter, kind streamKind) {
@@ -394,7 +447,7 @@ func (p *proxy) handleAfterThreshold(w http.ResponseWriter, r *http.Request, kin
 				return
 			}
 			remaining := p.cfg.idle - time.Since(lastWrite)
-			p.copySSEAfter(w, r, kind, streamReads(r.Context(), got.response.Body), remaining)
+			p.copySSEAfter(w, r, kind, streamReads(r.Context(), got.response.Body), remaining, newTerminalDetector(kind))
 			return
 		case <-timer.C:
 			if !writeFrame(w, keepaliveFrame(kind, time.Now())) {
@@ -411,12 +464,102 @@ func (p *proxy) handleAfterThreshold(w http.ResponseWriter, r *http.Request, kin
 
 func validSSE(resp *http.Response) bool {
 	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
-	return err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 && mediaType == "text/event-stream"
+	encoding := strings.TrimSpace(resp.Header.Get("Content-Encoding"))
+	return err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 && mediaType == "text/event-stream" && (encoding == "" || strings.EqualFold(encoding, "identity"))
 }
 
 type readResult struct {
 	data []byte
 	err  error
+}
+
+type terminalDetector struct {
+	kind     streamKind
+	buffer   []byte
+	terminal bool
+}
+
+func newTerminalDetector(kind streamKind) *terminalDetector {
+	return &terminalDetector{kind: kind}
+}
+
+func (d *terminalDetector) Write(chunk []byte) {
+	if d.terminal || len(chunk) == 0 {
+		return
+	}
+	if len(d.buffer)+len(chunk) > maxSSEEventSize {
+		d.buffer = d.buffer[:0]
+		if len(chunk) > maxSSEEventSize {
+			chunk = chunk[len(chunk)-maxSSEEventSize:]
+		}
+	}
+	d.buffer = append(d.buffer, chunk...)
+	for {
+		end, size := sseEventEnd(d.buffer)
+		if end < 0 {
+			return
+		}
+		event := d.buffer[:end]
+		d.buffer = d.buffer[end+size:]
+		if isTerminalEvent(d.kind, event) {
+			d.terminal = true
+			d.buffer = nil
+			return
+		}
+	}
+}
+
+func sseEventEnd(data []byte) (int, int) {
+	lf := bytes.Index(data, []byte("\n\n"))
+	cr := bytes.Index(data, []byte("\r\r"))
+	crlf := bytes.Index(data, []byte("\r\n\r\n"))
+	end, size := -1, 0
+	for _, candidate := range []struct {
+		end  int
+		size int
+	}{{lf, 2}, {cr, 2}, {crlf, 4}} {
+		if candidate.end >= 0 && (end < 0 || candidate.end < end) {
+			end, size = candidate.end, candidate.size
+		}
+	}
+	return end, size
+}
+
+func isTerminalEvent(kind streamKind, raw []byte) bool {
+	var eventName string
+	var dataLines []string
+	normalized := strings.ReplaceAll(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\r", "\n")
+	for _, line := range strings.Split(normalized, "\n") {
+		if strings.HasPrefix(line, "event:") {
+			eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+		}
+		if strings.HasPrefix(line, "data:") {
+			dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		}
+	}
+	payload := strings.Join(dataLines, "\n")
+	switch kind {
+	case streamChat:
+		return payload == "[DONE]"
+	case streamResponses:
+		var event struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal([]byte(payload), &event) != nil {
+			return false
+		}
+		return event.Type == "response.completed" || event.Type == "response.failed" || event.Type == "response.incomplete"
+	case streamMessages:
+		if eventName == "message_stop" {
+			return true
+		}
+		var event struct {
+			Type string `json:"type"`
+		}
+		return json.Unmarshal([]byte(payload), &event) == nil && event.Type == "message_stop"
+	default:
+		return false
+	}
 }
 
 func streamReads(ctx context.Context, body io.Reader) <-chan readResult {
@@ -439,11 +582,7 @@ func streamReads(ctx context.Context, body io.Reader) <-chan readResult {
 	return reads
 }
 
-func (p *proxy) copySSE(w http.ResponseWriter, r *http.Request, kind streamKind, reads <-chan readResult) {
-	p.copySSEAfter(w, r, kind, reads, p.cfg.idle)
-}
-
-func (p *proxy) copySSEAfter(w http.ResponseWriter, r *http.Request, kind streamKind, reads <-chan readResult, firstIdle time.Duration) {
+func (p *proxy) copySSEAfter(w http.ResponseWriter, r *http.Request, kind streamKind, reads <-chan readResult, firstIdle time.Duration, detector *terminalDetector) {
 	if firstIdle <= 0 {
 		firstIdle = time.Nanosecond
 	}
@@ -452,11 +591,14 @@ func (p *proxy) copySSEAfter(w http.ResponseWriter, r *http.Request, kind stream
 	for {
 		select {
 		case rr := <-reads:
-			if len(rr.data) > 0 && !writeFrame(w, rr.data) {
-				return
+			if len(rr.data) > 0 {
+				detector.Write(rr.data)
+				if !writeFrame(w, rr.data) {
+					return
+				}
 			}
 			if rr.err != nil {
-				if !errors.Is(rr.err, io.EOF) && r.Context().Err() == nil {
+				if !errors.Is(rr.err, io.EOF) && r.Context().Err() == nil && !detector.terminal {
 					writeFrame(w, errorFrame(kind))
 				}
 				return
@@ -465,17 +607,20 @@ func (p *proxy) copySSEAfter(w http.ResponseWriter, r *http.Request, kind stream
 		case <-timer.C:
 			select {
 			case rr := <-reads:
-				if len(rr.data) > 0 && !writeFrame(w, rr.data) {
-					return
+				if len(rr.data) > 0 {
+					detector.Write(rr.data)
+					if !writeFrame(w, rr.data) {
+						return
+					}
 				}
 				if rr.err != nil {
-					if !errors.Is(rr.err, io.EOF) && r.Context().Err() == nil {
+					if !errors.Is(rr.err, io.EOF) && r.Context().Err() == nil && !detector.terminal {
 						writeFrame(w, errorFrame(kind))
 					}
 					return
 				}
 			default:
-				if !writeFrame(w, keepaliveFrame(kind, time.Now())) {
+				if !detector.terminal && !writeFrame(w, keepaliveFrame(kind, time.Now())) {
 					return
 				}
 			}
@@ -512,11 +657,11 @@ func keepaliveFrame(kind streamKind, now time.Time) []byte {
 func errorFrame(kind streamKind) []byte {
 	switch kind {
 	case streamResponses:
-		return []byte("data: {\"type\":\"error\",\"error\":{\"type\":\"server_error\",\"message\":\"upstream stream failed\"}}\n\n")
+		return []byte("data: {\"type\":\"error\",\"code\":null,\"message\":\"Upstream stream failed before completion.\",\"param\":null}\n\n")
 	case streamChat:
-		return []byte("data: {\"error\":{\"message\":\"upstream stream failed\",\"type\":\"server_error\"}}\n\n")
+		return []byte("data: {\"error\":{\"message\":\"Upstream stream failed before completion.\",\"type\":\"stream_error\"}}\n\n")
 	case streamMessages:
-		return []byte("event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"upstream stream failed\"}}\n\n")
+		return []byte("event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Upstream stream failed before completion.\"}}\n\n")
 	default:
 		return nil
 	}

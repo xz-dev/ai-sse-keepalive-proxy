@@ -16,7 +16,9 @@ Plain APISIX/Nginx body filters run only when upstream sends body data, so they 
 
 Only exact JSON `POST` requests to `/v1/responses`, `/v1/chat/completions`, and `/v1/messages` with explicit boolean `"stream": true` are inspected. Body bytes are preserved exactly. Other requests, malformed JSON, oversized inspected bodies, and WebSocket upgrades use Go standard `httputil.ReverseProxy` unchanged.
 
-If valid SSE body bytes arrive within `HEADER_WAIT`, upstream status, headers, and body pass through. If first SSE body remains silent past threshold, service commits HTTP 200 `text/event-stream` and emits protocol-specific startup frame. Later frames appear only after `IDLE_INTERVAL` of upstream body silence. Once HTTP 200 is committed, later non-2xx, non-SSE, or stream failure can only be represented as generic protocol-shaped in-band error; upstream detail is never exposed.
+If valid SSE body bytes arrive within `HEADER_WAIT`, upstream status, headers, and body pass through. If first SSE body remains silent past threshold, service commits HTTP 200 `text/event-stream` and emits protocol-specific startup frame. Later frames appear only after `IDLE_INTERVAL` of upstream body silence. Complete protocol terminal events suppress all later synthetic keepalive/error frames, while any trailing upstream bytes still pass through unchanged. Once HTTP 200 is committed, later non-2xx, non-SSE, compressed, or stream failure can only be represented as generic protocol-shaped in-band error; upstream detail is never exposed.
+
+Eligible stream requests use a dedicated fixed-upstream client. It requests identity encoding, ignores environment proxy variables, disables automatic decompression, and returns redirects unchanged without contacting their targets. Ineligible fallback traffic keeps standard `httputil.ReverseProxy` behavior.
 
 ## Configuration
 
@@ -43,7 +45,7 @@ It checks `127.0.0.1` at port from `LISTEN_ADDR` with 2s timeout.
 
 ## Container publishing
 
-`Dockerfile` is directly buildable by `docker compose build`. Default-branch pushes publish conventional moving `ghcr.io/xz-dev/apisix-sse-keepalive:latest` plus immutable full commit-SHA tag. AI-gateway may consume this repository as submodule and build its own local image; it need not consume GHCR image.
+`Dockerfile` is directly buildable by `docker compose build`. Default-branch pushes publish `ghcr.io/xz-dev/apisix-sse-keepalive:latest` plus immutable full commit-SHA tag. AI-gateway may consume this repository as a Git submodule and build the same image locally with Compose; it need not consume GHCR image.
 
 ## Development
 
