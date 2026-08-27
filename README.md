@@ -18,9 +18,9 @@ Only exact JSON `POST` requests with explicit boolean `"stream": true` are inspe
 
 | Path | Protocol-visible keepalive | Terminal events |
 |---|---|---|
-| `/v1/responses` | OpenAI `response.in_progress` | `response.completed`, `response.failed`, `response.incomplete`, `error` |
+| `/v1/responses`, `/responses`, `/backend-api/codex/responses` | OpenAI `response.in_progress` | `response.completed`, `response.failed`, `response.incomplete`, `error` |
 | `/v1/chat/completions` | OpenAI empty delta chunk | `[DONE]` or top-level `error` |
-| `/v1/messages` | Anthropic `ping` | `message_stop` or `error` |
+| `/v1/messages`, `/antigravity/v1/messages` | Anthropic `ping` | `message_stop` or `error` |
 
 Body bytes are preserved exactly. Other paths and protocols, malformed JSON, oversized inspected bodies, and WebSocket upgrades use Go standard `httputil.ReverseProxy` unchanged.
 

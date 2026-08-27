@@ -315,11 +315,11 @@ func kindFor(method, path string) streamKind {
 		return streamNone
 	}
 	switch path {
-	case "/v1/responses":
+	case "/v1/responses", "/responses", "/backend-api/codex/responses":
 		return streamResponses
 	case "/v1/chat/completions":
 		return streamChat
-	case "/v1/messages":
+	case "/v1/messages", "/antigravity/v1/messages":
 		return streamMessages
 	default:
 		return streamNone

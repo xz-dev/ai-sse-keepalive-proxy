@@ -219,8 +219,11 @@ func TestSlowStartupAllShapes(t *testing.T) {
 		want string
 	}{
 		{"/v1/responses", `data: {"type":"response.in_progress"}`},
+		{"/responses", `data: {"type":"response.in_progress"}`},
+		{"/backend-api/codex/responses", `data: {"type":"response.in_progress"}`},
 		{"/v1/chat/completions", `"id":"chatcmpl-keepalive"`},
 		{"/v1/messages", "event: ping\ndata: {\"type\":\"ping\"}"},
+		{"/antigravity/v1/messages", "event: ping\ndata: {\"type\":\"ping\"}"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.path, func(t *testing.T) {
@@ -565,6 +568,30 @@ func TestHealthAndHealthcheck(t *testing.T) {
 	}
 	if err := healthcheck(u.Port()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestKindForProtocolAliases(t *testing.T) {
+	cases := map[string]streamKind{
+		"/v1/responses":                streamResponses,
+		"/responses":                   streamResponses,
+		"/backend-api/codex/responses": streamResponses,
+		"/v1/chat/completions":         streamChat,
+		"/v1/messages":                 streamMessages,
+		"/antigravity/v1/messages":     streamMessages,
+	}
+	for path, want := range cases {
+		if got := kindFor(http.MethodPost, path); got != want {
+			t.Errorf("kindFor(POST, %q) = %d, want %d", path, got, want)
+		}
+	}
+	for _, path := range []string{"/v1/responses/response-id", "/backend-api/codex/responses/response-id", "/antigravity/v1/messages/count_tokens"} {
+		if got := kindFor(http.MethodPost, path); got != streamNone {
+			t.Errorf("kindFor(POST, %q) = %d, want none", path, got)
+		}
+	}
+	if got := kindFor(http.MethodGet, "/responses"); got != streamNone {
+		t.Errorf("kindFor(GET, /responses) = %d, want none", got)
 	}
 }
 
