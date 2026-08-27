@@ -127,7 +127,9 @@ func healthcheck(listen string) error {
 	if err != nil || port == "" {
 		return fmt.Errorf("invalid LISTEN_ADDR %q", listen)
 	}
-	client := &http.Client{Timeout: 2 * time.Second}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	client := &http.Client{Timeout: 2 * time.Second, Transport: transport}
 	resp, err := client.Get("http://127.0.0.1:" + port + "/healthz")
 	if err != nil {
 		return err
@@ -239,7 +241,11 @@ func envPositiveInt(name string, fallback int64) (int64, error) {
 }
 
 func newProxy(cfg config) *proxy {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.DisableCompression = true
 	rp := &httputil.ReverseProxy{
+		Transport: transport,
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(cfg.upstream)
 			pr.Out.Host = cfg.upstream.Host
@@ -248,9 +254,6 @@ func newProxy(cfg config) *proxy {
 			}
 		},
 	}
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.Proxy = nil
-	transport.DisableCompression = true
 	client := &http.Client{
 		Transport: transport,
 		CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -354,8 +357,13 @@ func (p *proxy) serveStream(w http.ResponseWriter, r *http.Request, kind streamK
 	case got := <-result:
 		p.handleBeforeThreshold(w, r, kind, got, timer)
 	case <-timer.C:
-		p.openSlow(w, kind)
-		p.handleAfterThreshold(w, r, kind, result)
+		select {
+		case got := <-result:
+			p.handleAtThreshold(w, r, kind, got)
+		default:
+			p.openSlow(w, kind)
+			p.handleAfterThreshold(w, r, kind, result)
+		}
 	case <-r.Context().Done():
 		drainResult(result)
 	}
@@ -385,6 +393,30 @@ func (p *proxy) handleBeforeThreshold(w http.ResponseWriter, r *http.Request, ki
 
 	reads := streamReads(r.Context(), got.response.Body)
 	p.handleBeforeThresholdReads(w, r, kind, reads, newTerminalDetector(kind), got.response, timer)
+}
+
+func (p *proxy) handleAtThreshold(w http.ResponseWriter, r *http.Request, kind streamKind, got upstreamResult) {
+	if got.err != nil {
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+		return
+	}
+	defer got.response.Body.Close()
+	if !validSSE(got.response) {
+		copyHeader(w.Header(), got.response.Header)
+		w.WriteHeader(got.response.StatusCode)
+		_, _ = io.Copy(w, got.response.Body)
+		return
+	}
+
+	reads := streamReads(r.Context(), got.response.Body)
+	detector := newTerminalDetector(kind)
+	select {
+	case rr := <-reads:
+		p.handleInitialRead(w, r, kind, reads, detector, got.response, rr)
+	default:
+		p.openSlow(w, kind)
+		p.copySSEAfter(w, r, kind, reads, p.cfg.idle, detector)
+	}
 }
 
 func (p *proxy) handleBeforeThresholdReads(w http.ResponseWriter, r *http.Request, kind streamKind, reads <-chan readResult, detector *terminalDetector, resp *http.Response, timer *time.Timer) {
@@ -540,7 +572,13 @@ func isTerminalEvent(kind streamKind, raw []byte) bool {
 	payload := strings.Join(dataLines, "\n")
 	switch kind {
 	case streamChat:
-		return payload == "[DONE]"
+		if payload == "[DONE]" {
+			return true
+		}
+		var event struct {
+			Error json.RawMessage `json:"error"`
+		}
+		return json.Unmarshal([]byte(payload), &event) == nil && len(event.Error) > 0 && string(event.Error) != "null"
 	case streamResponses:
 		var event struct {
 			Type string `json:"type"`
@@ -548,15 +586,15 @@ func isTerminalEvent(kind streamKind, raw []byte) bool {
 		if json.Unmarshal([]byte(payload), &event) != nil {
 			return false
 		}
-		return event.Type == "response.completed" || event.Type == "response.failed" || event.Type == "response.incomplete"
+		return event.Type == "error" || event.Type == "response.completed" || event.Type == "response.failed" || event.Type == "response.incomplete"
 	case streamMessages:
-		if eventName == "message_stop" {
+		if eventName == "error" || eventName == "message_stop" {
 			return true
 		}
 		var event struct {
 			Type string `json:"type"`
 		}
-		return json.Unmarshal([]byte(payload), &event) == nil && event.Type == "message_stop"
+		return json.Unmarshal([]byte(payload), &event) == nil && (event.Type == "error" || event.Type == "message_stop")
 	default:
 		return false
 	}

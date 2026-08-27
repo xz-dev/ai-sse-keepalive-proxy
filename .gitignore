@@ -1,3 +1,4 @@
 .serena/
 .pi/
+/apisix-sse-keepalive
 /sse-keepalive

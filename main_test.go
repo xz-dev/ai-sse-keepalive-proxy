@@ -81,6 +81,10 @@ func TestEligibleClientIsFixedUpstream(t *testing.T) {
 	if !ok || transport.Proxy != nil || !transport.DisableCompression {
 		t.Fatalf("transport=%T proxyDisabled=%v disableCompression=%v", p.client.Transport, transport.Proxy == nil, transport.DisableCompression)
 	}
+	fallbackTransport, ok := p.fallback.Transport.(*http.Transport)
+	if !ok || fallbackTransport.Proxy != nil || !fallbackTransport.DisableCompression {
+		t.Fatalf("fallback transport=%T proxyDisabled=%v disableCompression=%v", p.fallback.Transport, fallbackTransport.Proxy == nil, fallbackTransport.DisableCompression)
+	}
 	front := httptest.NewServer(p)
 	defer front.Close()
 
@@ -363,8 +367,11 @@ func TestTerminalEventsSuppressGenericErrors(t *testing.T) {
 		terminal string
 	}{
 		{streamResponses, "data: {\"type\":\"response.failed\"}\n\n"},
+		{streamResponses, "data: {\"type\":\"error\",\"message\":\"failed\"}\n\n"},
 		{streamChat, "data: [DONE]\n\n"},
+		{streamChat, "data: {\"error\":{\"message\":\"failed\"}}\n\n"},
 		{streamMessages, "data: {\"type\":\"message_stop\"}\n\n"},
+		{streamMessages, "event: error\ndata: {\"type\":\"error\"}\n\n"},
 	}
 	for _, tc := range cases {
 		recorder := httptest.NewRecorder()

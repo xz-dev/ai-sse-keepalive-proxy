@@ -16,9 +16,9 @@ Plain APISIX/Nginx body filters run only when upstream sends body data, so they 
 
 Only exact JSON `POST` requests to `/v1/responses`, `/v1/chat/completions`, and `/v1/messages` with explicit boolean `"stream": true` are inspected. Body bytes are preserved exactly. Other requests, malformed JSON, oversized inspected bodies, and WebSocket upgrades use Go standard `httputil.ReverseProxy` unchanged.
 
-If valid SSE body bytes arrive within `HEADER_WAIT`, upstream status, headers, and body pass through. If first SSE body remains silent past threshold, service commits HTTP 200 `text/event-stream` and emits protocol-specific startup frame. Later frames appear only after `IDLE_INTERVAL` of upstream body silence. Complete protocol terminal events suppress all later synthetic keepalive/error frames, while any trailing upstream bytes still pass through unchanged. Once HTTP 200 is committed, later non-2xx, non-SSE, compressed, or stream failure can only be represented as generic protocol-shaped in-band error; upstream detail is never exposed.
+If valid SSE body bytes arrive within `HEADER_WAIT`, upstream status, headers, and body pass through. If first SSE body remains silent past threshold, service commits HTTP 200 `text/event-stream` and emits protocol-specific startup frame. Later frames appear only after `IDLE_INTERVAL` of upstream body silence. Complete protocol terminal or error events suppress all later synthetic keepalive/error frames, while any trailing upstream bytes still pass through unchanged. Once HTTP 200 is committed, later non-2xx, non-SSE, compressed, or stream failure can only be represented as generic protocol-shaped in-band error; upstream detail is never exposed.
 
-Eligible stream requests use a dedicated fixed-upstream client. It requests identity encoding, ignores environment proxy variables, disables automatic decompression, and returns redirects unchanged without contacting their targets. Ineligible fallback traffic keeps standard `httputil.ReverseProxy` behavior.
+All requests use a fixed-upstream transport that ignores environment proxy variables and disables automatic decompression. Eligible streams additionally request identity encoding and return redirects unchanged without contacting their targets; ineligible traffic keeps standard `httputil.ReverseProxy` response behavior.
 
 ## Configuration
 
