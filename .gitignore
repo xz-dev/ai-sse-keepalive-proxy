@@ -1,4 +1,3 @@
 .serena/
 .pi/
-/apisix-sse-keepalive
-/sse-keepalive
+/ai-sse-keepalive-proxy

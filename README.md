@@ -1,20 +1,28 @@
-# apisix-sse-keepalive
+# ai-sse-keepalive-proxy
 
-Small fixed-upstream Go reverse proxy for SSE startup and idle keepalives. Intended placement:
+Small fixed-upstream Go reverse proxy for parser-visible startup and idle keepalives in AI SSE protocols. It is intentionally protocol-specific rather than a generic arbitrary-SSE transformer.
 
 ```text
-APISIX -> SOCAT edge -> apisix-sse-keepalive -> SOCAT edge -> Sub2API
+API gateway -> directed relay -> ai-sse-keepalive-proxy -> directed relay -> AI upstream
 ```
 
-APISIX remains sole public and security boundary. It must authenticate, authorize, rate-limit, validate, and sanitize requests before forwarding here. This service has no admin, metrics, discovery, or user-selected proxy target.
+The API gateway (for example APISIX) remains the sole public and security boundary. It must authenticate, authorize, rate-limit, validate, and sanitize requests before forwarding here. This service has no admin, metrics, discovery, or user-selected proxy target.
 
 ## Why a separate proxy
 
-Plain APISIX/Nginx body filters run only when upstream sends body data, so they cannot produce output during upstream silence. OpenResty `body_filter` also disables control APIs and cosockets; timer callbacks cannot write downstream response bytes. A streaming reverse proxy must own downstream writer to send bytes while upstream body is idle.
+Plain APISIX/Nginx body filters run only when upstream sends body data, so they cannot produce output during upstream silence. OpenResty `body_filter` also disables control APIs and cosockets; timer callbacks cannot write downstream response bytes. A streaming reverse proxy must own the downstream writer to send bytes while the upstream body is idle.
 
 ## Behavior
 
-Only exact JSON `POST` requests to `/v1/responses`, `/v1/chat/completions`, and `/v1/messages` with explicit boolean `"stream": true` are inspected. Body bytes are preserved exactly. Other requests, malformed JSON, oversized inspected bodies, and WebSocket upgrades use Go standard `httputil.ReverseProxy` unchanged.
+Only exact JSON `POST` requests with explicit boolean `"stream": true` are inspected:
+
+| Path | Protocol-visible keepalive | Terminal events |
+|---|---|---|
+| `/v1/responses` | OpenAI `response.in_progress` | `response.completed`, `response.failed`, `response.incomplete`, `error` |
+| `/v1/chat/completions` | OpenAI empty delta chunk | `[DONE]` or top-level `error` |
+| `/v1/messages` | Anthropic `ping` | `message_stop` or `error` |
+
+Body bytes are preserved exactly. Other paths and protocols, malformed JSON, oversized inspected bodies, and WebSocket upgrades use Go standard `httputil.ReverseProxy` unchanged.
 
 If valid SSE body bytes arrive within `HEADER_WAIT`, upstream status, headers, and body pass through. If first SSE body remains silent past threshold, service commits HTTP 200 `text/event-stream` and emits protocol-specific startup frame. Later frames appear only after `IDLE_INTERVAL` of upstream body silence. Complete protocol terminal or error events suppress all later synthetic keepalive/error frames, while any trailing upstream bytes still pass through unchanged. Once HTTP 200 is committed, later non-2xx, non-SSE, compressed, or stream failure can only be represented as generic protocol-shaped in-band error; upstream detail is never exposed.
 
@@ -31,21 +39,21 @@ All requests use a fixed-upstream transport that ignores environment proxy varia
 | `MAX_INSPECT_BODY_BYTES` | `16777216` | Positive inspected body cap |
 | `REQUIRE_NO_DEFAULT_ROUTE` | `false` | When true, wait up to 5s for no IPv4 or non-loopback IPv6 default route before listening |
 
-`REQUIRE_NO_DEFAULT_ROUTE=true` is expected in hardened Compose topology where isolated SOCAT networks provide only directed service edges. Service still requires container/network policy: no public port, read-only filesystem, dropped capabilities, no-new-privileges, fixed upstream, and APISIX-only ingress.
+`REQUIRE_NO_DEFAULT_ROUTE=true` is expected in hardened Compose topology where isolated relays provide only directed service edges. Service still requires container/network policy: no public port, read-only filesystem, dropped capabilities, no-new-privileges, fixed upstream, and gateway-only ingress.
 
 ## Health
 
 `GET /healthz` returns `200 ok`. Scratch image includes healthcheck mode:
 
 ```sh
-/sse-keepalive healthcheck
+/ai-sse-keepalive-proxy healthcheck
 ```
 
 It checks `127.0.0.1` at port from `LISTEN_ADDR` with 2s timeout.
 
 ## Container publishing
 
-`Dockerfile` is directly buildable by `docker compose build`. Default-branch pushes publish `ghcr.io/xz-dev/apisix-sse-keepalive:latest` plus immutable full commit-SHA tag. AI-gateway may consume this repository as a Git submodule and build the same image locally with Compose; it need not consume GHCR image.
+`Dockerfile` is directly buildable by `docker compose build`. Default-branch pushes publish `ghcr.io/xz-dev/ai-sse-keepalive-proxy:latest` plus an immutable full commit-SHA tag. AI-gateway consumes this repository as a pinned Git submodule and builds the image locally with Compose; it does not depend on the GHCR image.
 
 ## Development
 
