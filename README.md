@@ -14,13 +14,15 @@ Plain APISIX/Nginx body filters run only when upstream sends body data, so they 
 
 ## Behavior
 
-Only exact JSON `POST` requests with explicit boolean `"stream": true` are inspected:
+Only exact JSON `POST` requests with explicit boolean `"stream": true` are inspected for SSE keepalive:
 
 | Path | Protocol-visible keepalive | Terminal events |
 |---|---|---|
 | `/v1/responses`, `/responses`, `/backend-api/codex/responses` | OpenAI `response.in_progress` | `response.completed`, `response.failed`, `response.incomplete`, `error` |
 | `/v1/chat/completions` | OpenAI empty delta chunk | `[DONE]` or top-level `error` |
 | `/v1/messages`, `/antigravity/v1/messages` | Anthropic `ping` | `message_stop` or `error` |
+
+Requests to those same paths with `"stream": false` (or no `stream` key) are proxied with **102 Processing heartbeat**: while the upstream stays silent past `IDLE_INTERVAL`, the service emits interim `HTTP/1.1 102 Processing` frames to keep the downstream connection warm, then forwards the final status, headers, and body unchanged. Interim 1xx frames are the only protocol-legal bytes before a non-stream response; HTTP/1.0 downstreams skip heartbeats and get plain passthrough. Cloudflare forwards 1xx responses, and httpx/aiohttp clients skip them transparently.
 
 Body bytes are preserved exactly. Other paths and protocols, malformed JSON, oversized inspected bodies, and WebSocket upgrades use Go standard `httputil.ReverseProxy` unchanged.
 
@@ -35,7 +37,7 @@ All requests use a fixed-upstream transport that ignores environment proxy varia
 | `UPSTREAM_URL` | required | Fixed plain `http` upstream; userinfo, query, and fragment rejected |
 | `LISTEN_ADDR` | `:8080` | Listen address |
 | `HEADER_WAIT` | `2s` | Positive Go duration before startup frame |
-| `IDLE_INTERVAL` | `15s` | Positive Go duration of upstream body silence between frames |
+| `IDLE_INTERVAL` | `15s` | Positive Go duration of upstream body silence between frames (also the non-stream 102 heartbeat interval) |
 | `MAX_INSPECT_BODY_BYTES` | `16777216` | Positive inspected body cap |
 | `REQUIRE_NO_DEFAULT_ROUTE` | `false` | When true, wait up to 5s for no IPv4 or non-loopback IPv6 default route before listening |
 

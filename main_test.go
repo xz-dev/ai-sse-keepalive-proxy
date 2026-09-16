@@ -122,6 +122,44 @@ func TestEligibleRedirectIsReturnedWithoutFollowing(t *testing.T) {
 	}
 }
 
+func TestNonStreamHeartbeatKeepsConnectionWarm(t *testing.T) {
+	release := make(chan struct{})
+	p, _ := testProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}), 50*time.Millisecond, 80*time.Millisecond, defaultMaxBody)
+
+	addr := strings.TrimPrefix(p.URL, "http://")
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	body := `{"stream":false}`
+	_, _ = fmt.Fprintf(conn, "POST /v1/chat/completions HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", addr, len(body), body)
+
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		close(release)
+	}()
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	raw, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	if got := strings.Count(text, "HTTP/1.1 102 Processing"); got < 2 {
+		t.Fatalf("interim 102 heartbeats = %d, want >=2; raw=%q", got, text)
+	}
+	if !strings.Contains(text, "HTTP/1.1 200 OK") || !strings.HasSuffix(text, `{"ok":true}`) {
+		t.Fatalf("final response missing or corrupted: %q", text)
+	}
+	if strings.Index(text, "102 Processing") > strings.Index(text, "200 OK") {
+		t.Fatalf("interim arrived after final: %q", text)
+	}
+}
+
 func TestNonStreamTransparentAndFixedUpstream(t *testing.T) {
 	body := `{"stream":false,"value":"exact"}`
 	var upstreamHost string

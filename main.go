@@ -263,6 +263,14 @@ func newProxy(cfg config) *proxy {
 	return &proxy{cfg: cfg, fallback: rp, client: client}
 }
 
+type inspectMode int
+
+const (
+	modePassThrough inspectMode = iota
+	modeStream
+	modeNonStream
+)
+
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/healthz" {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -270,19 +278,22 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "ok\n")
 		return
 	}
-	kind, body, ok := p.inspect(r)
-	if !ok {
+	kind, body, mode := p.inspect(r)
+	switch mode {
+	case modeStream:
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		p.serveStream(w, r, kind)
+	case modeNonStream:
+		p.serveNonStream(w, r)
+	default:
 		p.fallback.ServeHTTP(w, r)
-		return
 	}
-	r.Body = io.NopCloser(bytes.NewReader(body))
-	p.serveStream(w, r, kind)
 }
 
-func (p *proxy) inspect(r *http.Request) (streamKind, []byte, bool) {
+func (p *proxy) inspect(r *http.Request) (streamKind, []byte, inspectMode) {
 	kind := kindFor(r.Method, r.URL.Path)
 	if kind == streamNone || r.Body == nil || !isJSON(r.Header.Get("Content-Type")) {
-		return streamNone, nil, false
+		return streamNone, nil, modePassThrough
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, p.cfg.maxBody+1))
 	if err != nil {
@@ -290,24 +301,27 @@ func (p *proxy) inspect(r *http.Request) (streamKind, []byte, bool) {
 			io.Reader
 			io.Closer
 		}{io.MultiReader(bytes.NewReader(body), r.Body), r.Body}
-		return streamNone, nil, false
+		return streamNone, nil, modePassThrough
 	}
 	if int64(len(body)) > p.cfg.maxBody {
 		r.Body = struct {
 			io.Reader
 			io.Closer
 		}{io.MultiReader(bytes.NewReader(body), r.Body), r.Body}
-		return streamNone, nil, false
+		return streamNone, nil, modePassThrough
 	}
 	_ = r.Body.Close()
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	var envelope struct {
 		Stream *bool `json:"stream"`
 	}
-	if json.Unmarshal(body, &envelope) != nil || envelope.Stream == nil || !*envelope.Stream {
-		return streamNone, nil, false
+	if json.Unmarshal(body, &envelope) != nil {
+		return streamNone, nil, modePassThrough
 	}
-	return kind, body, true
+	if envelope.Stream != nil && *envelope.Stream {
+		return kind, body, modeStream
+	}
+	return kind, body, modeNonStream
 }
 
 func kindFor(method, path string) streamKind {
@@ -366,6 +380,57 @@ func (p *proxy) serveStream(w http.ResponseWriter, r *http.Request, kind streamK
 		}
 	case <-r.Context().Done():
 		drainResult(result)
+	}
+}
+
+// serveNonStream proxies a non-streaming completion while keeping the
+// downstream connection warm with 102 Processing interim responses whenever
+// the upstream stays silent longer than cfg.idle. Interim 1xx frames are the
+// only protocol-legal bytes a server may emit before a final non-stream
+// response; Cloudflare forwards all 1xx responses, and httpx/aiohttp clients
+// skip them transparently. Clients speaking HTTP/1.0 get plain passthrough
+// because 1xx is undefined there.
+func (p *proxy) serveNonStream(w http.ResponseWriter, r *http.Request) {
+	req := r.Clone(r.Context())
+	req.URL = joinURL(p.cfg.upstream, r.URL)
+	req.Host = p.cfg.upstream.Host
+	req.RequestURI = ""
+	req.Header = r.Header.Clone()
+	removeHopHeaders(req.Header)
+	req.Header.Set("Accept-Encoding", "identity")
+
+	result := make(chan upstreamResult, 1)
+	go func() {
+		resp, err := p.client.Do(req)
+		result <- upstreamResult{resp, err}
+	}()
+
+	heartbeat := time.NewTicker(p.cfg.idle)
+	defer heartbeat.Stop()
+	canInterim := r.ProtoAtLeast(1, 1)
+	for {
+		select {
+		case got := <-result:
+			if got.err != nil {
+				http.Error(w, "bad gateway", http.StatusBadGateway)
+				return
+			}
+			defer got.response.Body.Close()
+			copyHeader(w.Header(), got.response.Header)
+			w.WriteHeader(got.response.StatusCode)
+			_, _ = io.Copy(w, got.response.Body)
+			return
+		case <-heartbeat.C:
+			if !canInterim {
+				continue
+			}
+			// WriteHeader(1xx) flushes the server's buffered writer itself;
+			// a manual Flush would latch a final 200 instead.
+			w.WriteHeader(http.StatusProcessing)
+		case <-r.Context().Done():
+			drainResult(result)
+			return
+		}
 	}
 }
 
