@@ -149,13 +149,13 @@ func TestNonStreamHeartbeatKeepsConnectionWarm(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(raw)
-	if got := strings.Count(text, "HTTP/1.1 102 Processing"); got < 2 {
-		t.Fatalf("interim 102 heartbeats = %d, want >=2; raw=%q", got, text)
+	if got := strings.Count(text, "HTTP/1.1 103 Early Hints"); got < 2 {
+		t.Fatalf("interim 103 heartbeats = %d, want >=2; raw=%q", got, text)
 	}
 	if !strings.Contains(text, "HTTP/1.1 200 OK") || !strings.HasSuffix(text, `{"ok":true}`) {
 		t.Fatalf("final response missing or corrupted: %q", text)
 	}
-	if strings.Index(text, "102 Processing") > strings.Index(text, "200 OK") {
+	if strings.Index(text, "103 Early Hints") > strings.Index(text, "200 OK") {
 		t.Fatalf("interim arrived after final: %q", text)
 	}
 }

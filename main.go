@@ -384,12 +384,13 @@ func (p *proxy) serveStream(w http.ResponseWriter, r *http.Request, kind streamK
 }
 
 // serveNonStream proxies a non-streaming completion while keeping the
-// downstream connection warm with 102 Processing interim responses whenever
+// downstream connection warm with 103 Early Hints interim responses whenever
 // the upstream stays silent longer than cfg.idle. Interim 1xx frames are the
 // only protocol-legal bytes a server may emit before a final non-stream
-// response; Cloudflare forwards all 1xx responses, and httpx/aiohttp clients
-// skip them transparently. Clients speaking HTTP/1.0 get plain passthrough
-// because 1xx is undefined there.
+// response; Cloudflare forwards all 1xx responses, nginx forwards 103 with
+// early_hints enabled, and httpx/aiohttp clients skip them transparently.
+// Clients speaking HTTP/1.0 get plain passthrough because 1xx is undefined
+// there.
 func (p *proxy) serveNonStream(w http.ResponseWriter, r *http.Request) {
 	req := r.Clone(r.Context())
 	req.URL = joinURL(p.cfg.upstream, r.URL)
@@ -426,7 +427,7 @@ func (p *proxy) serveNonStream(w http.ResponseWriter, r *http.Request) {
 			}
 			// WriteHeader(1xx) flushes the server's buffered writer itself;
 			// a manual Flush would latch a final 200 instead.
-			w.WriteHeader(http.StatusProcessing)
+			w.WriteHeader(http.StatusEarlyHints)
 		case <-r.Context().Done():
 			drainResult(result)
 			return
