@@ -136,6 +136,23 @@ func (p *proxy) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	subprotocols := headerTokens(r.Header, "Sec-WebSocket-Protocol")
 
+	// Transparent extension negotiation: offer permessage-deflate on the
+	// upstream leg only when the client asked for it, and accept it on the
+	// downstream leg only when the client offered it. The proxy terminates
+	// compression per-leg (never copies raw compressed frames); this preserves
+	// whatever the client and upstream would have negotiated end-to-end.
+	clientWantsDeflate := false
+	for _, tok := range headerTokens(r.Header, "Sec-WebSocket-Extensions") {
+		if name, _, _ := strings.Cut(tok, ";"); strings.EqualFold(strings.TrimSpace(name), "permessage-deflate") {
+			clientWantsDeflate = true
+			break
+		}
+	}
+	dialCompression := websocket.CompressionDisabled
+	if clientWantsDeflate {
+		dialCompression = websocket.CompressionContextTakeover
+	}
+
 	dialCtx, dialCancel := context.WithTimeout(r.Context(), p.cfg.wsHandshakeTimeout)
 	defer dialCancel()
 	upConn, _, err := websocket.Dial(dialCtx, upstreamURL.String(), &websocket.DialOptions{
@@ -143,7 +160,7 @@ func (p *proxy) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 		HTTPHeader:      upHeader,
 		Host:            p.cfg.upstream.Host,
 		Subprotocols:    subprotocols,
-		CompressionMode: websocket.CompressionContextTakeover,
+		CompressionMode: dialCompression,
 	})
 	if err != nil {
 		var rej *wsRejection
@@ -169,10 +186,14 @@ func (p *proxy) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	if selectedSub != "" {
 		acceptSubs = []string{selectedSub}
 	}
+	acceptCompression := websocket.CompressionDisabled
+	if clientWantsDeflate {
+		acceptCompression = websocket.CompressionContextTakeover
+	}
 	clientConn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		Subprotocols:       acceptSubs,
 		InsecureSkipVerify: true, // preserve transparent admission: upstream decides Origin policy
-		CompressionMode:    websocket.CompressionContextTakeover,
+		CompressionMode:    acceptCompression,
 	})
 	if err != nil {
 		_ = upConn.CloseNow()

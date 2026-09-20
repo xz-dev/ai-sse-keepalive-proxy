@@ -850,3 +850,83 @@ func TestWSAbruptUpstreamIsAbnormal(t *testing.T) {
 		t.Fatal("expected abnormal closure error")
 	}
 }
+
+// WS compression passthrough: deflate is negotiated on a leg only when the
+// client offered it. Verified black-box via the Sec-WebSocket-Extensions
+// header each side observes (no library internals).
+func TestWSCompressionPassthrough(t *testing.T) {
+	var sawUpstreamExt atomic.Bool // upstream saw a deflate offer from the proxy
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawUpstreamExt.Store(strings.Contains(
+			r.Header.Get("Sec-WebSocket-Extensions"), "permessage-deflate"))
+		c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			CompressionMode: websocket.CompressionContextTakeover,
+		})
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		c.SetReadLimit(-1)
+		for {
+			typ, msg, err := c.Read(r.Context())
+			if err != nil {
+				return
+			}
+			_ = c.Write(r.Context(), typ, msg)
+		}
+	}))
+	defer up.Close()
+	u, _ := url.Parse(up.URL)
+	front := httptest.NewServer(newProxy(wsProxyCfg(u)))
+	defer front.Close()
+
+	t.Run("client offers deflate", func(t *testing.T) {
+		sawUpstreamExt.Store(false)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		conn, resp, err := websocket.Dial(ctx, "ws"+front.URL[4:]+"/v1/responses", &websocket.DialOptions{
+			CompressionMode: websocket.CompressionContextTakeover,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.CloseNow()
+		conn.SetReadLimit(-1)
+		if !strings.Contains(resp.Header.Get("Sec-WebSocket-Extensions"), "permessage-deflate") {
+			t.Fatal("downstream leg did not negotiate deflate though client offered it")
+		}
+		if !sawUpstreamExt.Load() {
+			t.Fatal("proxy did not offer deflate upstream though client offered it")
+		}
+		if err := conn.Write(ctx, websocket.MessageText, []byte("ping")); err != nil {
+			t.Fatal(err)
+		}
+		if _, msg, err := conn.Read(ctx); err != nil || string(msg) != "ping" {
+			t.Fatalf("echo over compressed legs: %v %q", err, msg)
+		}
+	})
+
+	t.Run("client does not offer deflate", func(t *testing.T) {
+		sawUpstreamExt.Store(false)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		conn, resp, err := websocket.Dial(ctx, "ws"+front.URL[4:]+"/v1/responses", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.CloseNow()
+		conn.SetReadLimit(-1)
+		if strings.Contains(resp.Header.Get("Sec-WebSocket-Extensions"), "permessage-deflate") {
+			t.Fatal("downstream leg negotiated deflate though client never offered it")
+		}
+		if sawUpstreamExt.Load() {
+			t.Fatal("proxy offered deflate upstream though client never offered it")
+		}
+		if err := conn.Write(ctx, websocket.MessageText, []byte("ping")); err != nil {
+			t.Fatal(err)
+		}
+		if _, msg, err := conn.Read(ctx); err != nil || string(msg) != "ping" {
+			t.Fatalf("echo over plain legs: %v %q", err, msg)
+		}
+	})
+}
