@@ -148,6 +148,9 @@ func (p *proxy) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var rej *wsRejection
 		if errors.As(err, &rej) {
+			if rej.truncated {
+				log.Printf("ws rejection body truncated at %d bytes", wsRejectionBodyCap)
+			}
 			copyHeader(w.Header(), rej.header)
 			// Recompute Content-Length for the (possibly truncated) captured body.
 			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(rej.body)))
@@ -326,11 +329,19 @@ func (s *wsSession) terminate() {
 
 func (p *proxy) registerWS(s *wsSession) {
 	p.wsMu.Lock()
-	defer p.wsMu.Unlock()
+	if p.wsClosing {
+		// closeAllWS already snapshotted; a session that registered after the
+		// snapshot would escape termination. Terminate it inline so a shutdown
+		// cannot strand a hijacked socket.
+		p.wsMu.Unlock()
+		s.terminate()
+		return
+	}
 	if p.wsSessions == nil {
 		p.wsSessions = make(map[*wsSession]struct{})
 	}
 	p.wsSessions[s] = struct{}{}
+	p.wsMu.Unlock()
 }
 
 func (p *proxy) unregisterWS(s *wsSession) {
@@ -339,16 +350,24 @@ func (p *proxy) unregisterWS(s *wsSession) {
 	delete(p.wsSessions, s)
 }
 
-// closeAllWS terminates every registered WS session; used during shutdown so
-// hijacked connections do not outlive the HTTP server's drain budget.
+// closeAllWS terminates every registered WS session concurrently under the
+// shared shutdown deadline. Sessions that register after the snapshot are
+// caught by the wsClosing flag inside registerWS and terminated inline.
 func (p *proxy) closeAllWS() {
 	p.wsMu.Lock()
+	p.wsClosing = true
 	sessions := make([]*wsSession, 0, len(p.wsSessions))
 	for s := range p.wsSessions {
 		sessions = append(sessions, s)
 	}
 	p.wsMu.Unlock()
+	var wg sync.WaitGroup
 	for _, s := range sessions {
-		s.terminate()
+		wg.Add(1)
+		go func(s *wsSession) {
+			defer wg.Done()
+			s.terminate()
+		}(s)
 	}
+	wg.Wait()
 }

@@ -49,6 +49,7 @@ type proxy struct {
 	wsTransport *http.Transport
 	wsMu        sync.Mutex
 	wsSessions  map[*wsSession]struct{}
+	wsClosing   bool
 }
 
 type streamKind int
@@ -108,12 +109,13 @@ func serve(ctx context.Context, srv *http.Server, listener net.Listener, shutdow
 	case <-ctx.Done():
 	}
 
-	// Tear down hijacked WS sessions immediately — srv.Shutdown does not wait
-	// for hijacked connections, so doing this first bounds their extra life to
-	// their own close grace rather than the whole drain budget. Runs async so
-	// it can't serialize a slow close into the Shutdown window.
+	// Tear down hijacked WS sessions before the HTTP drain — srv.Shutdown does
+	// not wait for hijacked connections. closeAllWS terminates all registered
+	// sessions concurrently under their own close grace and joins them before
+	// returning, so it is synchronous here and bounded by each session's grace,
+	// not serialized across N sessions.
 	if closeWS != nil {
-		go closeWS()
+		closeWS()
 	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	err := srv.Shutdown(shutdownCtx)

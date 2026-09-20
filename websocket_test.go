@@ -739,3 +739,50 @@ func TestWSTrueWriteStallNoReader(t *testing.T) {
 		t.Fatal("write-stall path hung: writer.Close() deadlock suspected")
 	}
 }
+
+// C4: a session registering after closeAllWS's snapshot is terminated inline
+// via the wsClosing flag, not left running.
+func TestWSLateRegistrationTerminated(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		<-r.Context().Done()
+	}))
+	defer up.Close()
+	u, _ := url.Parse(up.URL)
+
+	p := newProxy(wsProxyCfg(u))
+	front := httptest.NewServer(p)
+	defer front.Close()
+
+	// Establish a real session so s.terminate() has live conns to close.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+front.URL[4:]+"/v1/responses", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+
+	// Flip closing, then register a second session object wrapping the live
+	// client conn — wsClosing must terminate it inline.
+	p.wsMu.Lock()
+	p.wsClosing = true
+	p.wsMu.Unlock()
+
+	s := &wsSession{
+		id:       wsSessionSeq.Add(1),
+		client:   conn,
+		upstream: conn, // same live conn; CloseNow on it is fine
+		done:     make(chan struct{}),
+	}
+	p.registerWS(s)
+	select {
+	case <-s.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("late-registered session escaped termination")
+	}
+}
