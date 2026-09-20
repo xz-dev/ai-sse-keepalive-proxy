@@ -786,3 +786,67 @@ func TestWSLateRegistrationTerminated(t *testing.T) {
 		t.Fatal("late-registered session escaped termination")
 	}
 }
+
+// Close-code fidelity: an upstream close frame's real code is forwarded to the
+// client (not masked as 1000); an abrupt transport drop surfaces as abnormal.
+func TestWSCloseCodeForwarded(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		_ = c.Write(r.Context(), websocket.MessageText, []byte("bye"))
+		_ = c.Close(websocket.StatusInternalError, "boom")
+	}))
+	defer up.Close()
+	u, _ := url.Parse(up.URL)
+	front := httptest.NewServer(newProxy(wsProxyCfg(u)))
+	defer front.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+front.URL[4:]+"/v1/responses", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+	_, _, _ = conn.Read(ctx)
+	_, _, err = conn.Read(ctx)
+	var ce websocket.CloseError
+	if !errors.As(err, &ce) || ce.Code != websocket.StatusInternalError {
+		t.Fatalf("close code=%v err=%v, want 1011", ce.Code, err)
+	}
+}
+
+func TestWSAbruptUpstreamIsAbnormal(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		_ = c.Write(r.Context(), websocket.MessageText, []byte("hi"))
+		_ = c.CloseNow() // bare TCP drop, no close frame
+	}))
+	defer up.Close()
+	u, _ := url.Parse(up.URL)
+	front := httptest.NewServer(newProxy(wsProxyCfg(u)))
+	defer front.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+front.URL[4:]+"/v1/responses", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+	_, _, _ = conn.Read(ctx)
+	_, _, err = conn.Read(ctx)
+	// Abnormal = CloseError 1006 or a raw transport error, NOT a clean 1000.
+	var ce websocket.CloseError
+	if errors.As(err, &ce) && ce.Code == websocket.StatusNormalClosure {
+		t.Fatalf("abrupt upstream masked as clean 1000: %v", ce)
+	}
+	if err == nil {
+		t.Fatal("expected abnormal closure error")
+	}
+}

@@ -207,8 +207,8 @@ func (p *proxy) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	}()
 	go func() {
 		defer wg.Done()
-		s.relay(p.cfg, upConn, clientConn) // upstream -> client
-		s.terminate()
+		end := s.relay(p.cfg, upConn, clientConn) // upstream -> client
+		s.terminateWith(end)
 	}()
 	go s.heartbeat(p.cfg)
 	wg.Wait()
@@ -216,17 +216,27 @@ func (p *proxy) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 
 // relay copies messages from src to dst: one reader per leg, one writer per
 // destination, streaming through a bounded buffer. Backpressure pauses
-// forwarding rather than buffering whole messages.
-func (s *wsSession) relay(cfg config, src, dst *websocket.Conn) {
+// forwarding rather than buffering whole messages. It reports how the source
+// ended so the peer sees a faithful close status, not a fabricated 1000.
+type relayEnd struct {
+	code  websocket.StatusCode // wire close code when src ended with a close frame
+	clean bool                 // true when src ended with a close frame
+}
+
+func (s *wsSession) relay(cfg config, src, dst *websocket.Conn) relayEnd {
 	buf := make([]byte, wsCopyBufferSize)
 	for {
 		typ, reader, err := src.Reader(context.Background())
 		if err != nil {
-			return
+			var ce websocket.CloseError
+			if errors.As(err, &ce) {
+				return relayEnd{code: ce.Code, clean: true}
+			}
+			return relayEnd{clean: false} // abrupt transport failure -> 1006 downstream
 		}
 		writer, err := dst.Writer(context.Background(), typ)
 		if err != nil {
-			return
+			return relayEnd{clean: false}
 		}
 		n, copyErr := io.CopyBuffer(&wsWriteTimeoutWriter{w: writer, timeout: cfg.wsWriteTimeout}, reader, buf)
 		if copyErr != nil {
@@ -234,10 +244,10 @@ func (s *wsSession) relay(cfg config, src, dst *websocket.Conn) {
 			// writer's internal lock held by the abandoned Write goroutine; calling
 			// writer.Close() here would deadlock. Bail and let terminate() force
 			// the underlying connection, which releases it.
-			return
+			return relayEnd{clean: false}
 		}
 		if err := writer.Close(); err != nil {
-			return
+			return relayEnd{clean: false}
 		}
 		s.appMsgs.Add(1)
 		s.appBytes.Add(n)
@@ -308,15 +318,29 @@ func (s *wsSession) heartbeat(cfg config) {
 // grace lets the close handshake complete before the socket is forced. The
 // upstream leg is closed immediately since nothing needs its handshake.
 func (s *wsSession) terminate() {
+	s.terminateWith(relayEnd{code: websocket.StatusNormalClosure, clean: true})
+}
+
+// terminateWith tears the pair down, forwarding the real close status to the
+// client when the upstream ended with a close frame, or dropping the socket
+// (abnormal 1006) when the upstream died on the transport.
+func (s *wsSession) terminateWith(end relayEnd) {
 	s.closeOnce.Do(func() {
 		close(s.done)
 		_ = s.upstream.CloseNow()
-		// Close blocks until the close handshake completes or fails; give it a
-		// bounded window then force the socket so relays can't hang on a peer
-		// that never answers the close frame.
+		if !end.clean {
+			// Abrupt upstream failure: don't fabricate a clean close; let the
+			// client observe abnormal closure.
+			_ = s.client.CloseNow()
+			return
+		}
+		// Forward the peer's real close code so a graceful upstream close stays
+		// faithful. Close blocks until the close handshake completes or fails;
+		// give it a bounded window then force the socket so relays can't hang on
+		// a peer that never answers the close frame.
 		done := make(chan struct{})
 		go func() {
-			_ = s.client.Close(websocket.StatusNormalClosure, "")
+			_ = s.client.Close(end.code, "")
 			close(done)
 		}()
 		select {
