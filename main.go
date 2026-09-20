@@ -19,6 +19,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -35,12 +36,19 @@ type config struct {
 	idle                  time.Duration
 	maxBody               int64
 	requireNoDefaultRoute bool
+	wsPingInterval        time.Duration
+	wsPingTimeout         time.Duration
+	wsWriteTimeout        time.Duration
+	wsHandshakeTimeout    time.Duration
 }
 
 type proxy struct {
-	cfg      config
-	fallback *httputil.ReverseProxy
-	client   *http.Client
+	cfg         config
+	fallback    *httputil.ReverseProxy
+	client      *http.Client
+	wsTransport *http.Transport
+	wsMu        sync.Mutex
+	wsSessions  map[*wsSession]struct{}
 }
 
 type streamKind int
@@ -82,12 +90,12 @@ func main() {
 		log.Fatal(err)
 	}
 	log.Printf("listening on %s", listener.Addr())
-	if err := serve(ctx, srv, listener, 10*time.Second); err != nil {
+	if err := serve(ctx, srv, listener, 10*time.Second, p.closeAllWS); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func serve(ctx context.Context, srv *http.Server, listener net.Listener, shutdownTimeout time.Duration) error {
+func serve(ctx context.Context, srv *http.Server, listener net.Listener, shutdownTimeout time.Duration, closeWS func()) error {
 	result := make(chan error, 1)
 	go func() { result <- srv.Serve(listener) }()
 
@@ -100,6 +108,13 @@ func serve(ctx context.Context, srv *http.Server, listener net.Listener, shutdow
 	case <-ctx.Done():
 	}
 
+	// Tear down hijacked WS sessions immediately — srv.Shutdown does not wait
+	// for hijacked connections, so doing this first bounds their extra life to
+	// their own close grace rather than the whole drain budget. Runs async so
+	// it can't serialize a slow close into the Shutdown window.
+	if closeWS != nil {
+		go closeWS()
+	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	err := srv.Shutdown(shutdownCtx)
 	cancel()
@@ -170,7 +185,43 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
-	return config{upstream: u, listen: listen, wait: wait, idle: idle, maxBody: maxBody, requireNoDefaultRoute: requireNoDefaultRoute}, nil
+	wsPingInterval, err := envDurationAllowZero("WS_PING_INTERVAL", 0)
+	if err != nil {
+		return config{}, err
+	}
+	wsPingTimeout, err := envDuration("WS_PING_TIMEOUT", 5*time.Second)
+	if err != nil {
+		return config{}, err
+	}
+	wsWriteTimeout, err := envDuration("WS_WRITE_TIMEOUT", 120*time.Second)
+	if err != nil {
+		return config{}, err
+	}
+	wsHandshakeTimeout, err := envDuration("WS_HANDSHAKE_TIMEOUT", 10*time.Second)
+	if err != nil {
+		return config{}, err
+	}
+	if wsPingInterval > 0 && wsPingTimeout >= wsPingInterval {
+		return config{}, errors.New("WS_PING_TIMEOUT must be less than WS_PING_INTERVAL")
+	}
+	return config{
+		upstream: u, listen: listen, wait: wait, idle: idle, maxBody: maxBody,
+		requireNoDefaultRoute: requireNoDefaultRoute,
+		wsPingInterval:        wsPingInterval, wsPingTimeout: wsPingTimeout,
+		wsWriteTimeout: wsWriteTimeout, wsHandshakeTimeout: wsHandshakeTimeout,
+	}, nil
+}
+
+func envDurationAllowZero(name string, fallback time.Duration) (time.Duration, error) {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return fallback, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d < 0 {
+		return 0, fmt.Errorf("%s must be a non-negative Go duration", name)
+	}
+	return d, nil
 }
 
 func envBool(name string, fallback bool) (bool, error) {
@@ -260,7 +311,7 @@ func newProxy(cfg config) *proxy {
 			return http.ErrUseLastResponse
 		},
 	}
-	return &proxy{cfg: cfg, fallback: rp, client: client}
+	return &proxy{cfg: cfg, fallback: rp, client: client, wsTransport: transport}
 }
 
 type inspectMode int
@@ -279,6 +330,10 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	kind, body, mode := p.inspect(r)
+	if mode == modePassThrough && isWSUpgrade(r) {
+		p.serveWebSocket(w, r)
+		return
+	}
 	switch mode {
 	case modeStream:
 		r.Body = io.NopCloser(bytes.NewReader(body))

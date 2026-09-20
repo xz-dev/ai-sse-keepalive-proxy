@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 FROM docker.io/library/golang:1.26.7-alpine3.24 AS builder
 WORKDIR /src
-COPY go.mod main.go ./
+COPY go.mod go.sum main.go websocket.go ./
 RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w -buildid=' -o /ai-sse-keepalive-proxy .
 
 FROM scratch

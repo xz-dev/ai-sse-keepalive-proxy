@@ -333,7 +333,7 @@ func TestServeWaitsForActiveHandler(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- serve(ctx, srv, listener, time.Second) }()
+	go func() { done <- serve(ctx, srv, listener, time.Second, nil) }()
 
 	response := make(chan *http.Response, 1)
 	go func() {
