@@ -582,7 +582,7 @@ func (p *proxy) openSlow(w http.ResponseWriter, kind streamKind) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
-	writeFrame(w, keepaliveFrame(kind, time.Now()))
+	writeFrame(w, keepaliveFrame(kind))
 }
 
 func (p *proxy) handleAfterThreshold(w http.ResponseWriter, r *http.Request, kind streamKind, result <-chan upstreamResult) {
@@ -605,7 +605,7 @@ func (p *proxy) handleAfterThreshold(w http.ResponseWriter, r *http.Request, kin
 			p.copySSEAfter(w, r, kind, streamReads(r.Context(), got.response.Body), remaining, newTerminalDetector(kind))
 			return
 		case <-timer.C:
-			if !writeFrame(w, keepaliveFrame(kind, time.Now())) {
+			if !writeFrame(w, keepaliveFrame(kind)) {
 				return
 			}
 			lastWrite = time.Now()
@@ -781,7 +781,7 @@ func (p *proxy) copySSEAfter(w http.ResponseWriter, r *http.Request, kind stream
 					return
 				}
 			default:
-				if !detector.terminal && !writeFrame(w, keepaliveFrame(kind, time.Now())) {
+				if !detector.terminal && !writeFrame(w, keepaliveFrame(kind)) {
 					return
 				}
 			}
@@ -802,12 +802,13 @@ func writeFrame(w http.ResponseWriter, data []byte) bool {
 	return true
 }
 
-func keepaliveFrame(kind streamKind, now time.Time) []byte {
+func keepaliveFrame(kind streamKind) []byte {
 	switch kind {
 	case streamResponses:
 		return []byte("data: {\"type\":\"response.in_progress\"}\n\n")
 	case streamChat:
-		return []byte(fmt.Sprintf("data: {\"id\":\"chatcmpl-keepalive\",\"object\":\"chat.completion.chunk\",\"created\":%d,\"model\":\"keepalive\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":null}]}\n\n", now.Unix()))
+		// SSE comment frame: protocol-level keepalive, invisible to data consumers
+		return []byte(": keepalive\n\n")
 	case streamMessages:
 		return []byte("event: ping\ndata: {\"type\":\"ping\"}\n\n")
 	default:

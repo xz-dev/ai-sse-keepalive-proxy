@@ -221,7 +221,7 @@ func TestFastSSEIdleAndFrequentData(t *testing.T) {
 		}), 100*time.Millisecond, 20*time.Millisecond, defaultMaxBody)
 		resp := request(t, http.DefaultClient, http.MethodPost, p.URL+"/v1/chat/completions", "application/json", `{"stream":true}`)
 		body := readAll(t, resp)
-		if strings.Contains(body, "chatcmpl-keepalive") {
+		if strings.Contains(body, ": keepalive") {
 			t.Fatalf("heartbeat emitted during active stream: %q", body)
 		}
 	})
@@ -259,7 +259,7 @@ func TestSlowStartupAllShapes(t *testing.T) {
 		{"/v1/responses", `data: {"type":"response.in_progress"}`},
 		{"/responses", `data: {"type":"response.in_progress"}`},
 		{"/backend-api/codex/responses", `data: {"type":"response.in_progress"}`},
-		{"/v1/chat/completions", `"id":"chatcmpl-keepalive"`},
+		{"/v1/chat/completions", `: keepalive`},
 		{"/v1/messages", "event: ping\ndata: {\"type\":\"ping\"}"},
 		{"/antigravity/v1/messages", "event: ping\ndata: {\"type\":\"ping\"}"},
 	}
@@ -374,7 +374,7 @@ func TestTerminalEventsSuppressSyntheticFrames(t *testing.T) {
 		synthetic string
 	}{
 		{"responses", "/v1/responses", []string{"data: {\"type\":\"response.comp", "leted\"}\n\n", "data: trailing\n\n"}, "response.in_progress"},
-		{"chat", "/v1/chat/completions", []string{"data: [DO", "NE]\n\n", "data: trailing\n\n"}, "chatcmpl-keepalive"},
+		{"chat", "/v1/chat/completions", []string{"data: [DO", "NE]\n\n", "data: trailing\n\n"}, ": keepalive"},
 		{"messages", "/v1/messages", []string{"event: message_", "stop\ndata: {\"type\":\"message_stop\"}\n\n", "data: trailing\n\n"}, "event: ping"},
 	}
 	for _, tc := range cases {
@@ -452,10 +452,20 @@ func TestStartupTimerConsumesReadyEOF(t *testing.T) {
 }
 
 func TestExactSyntheticFrames(t *testing.T) {
-	if got, want := string(keepaliveFrame(streamResponses, time.Unix(1, 0))), "data: {\"type\":\"response.in_progress\"}\n\n"; got != want {
-		t.Fatalf("responses keepalive=%q", got)
-	}
 	cases := []struct {
+		kind streamKind
+		want string
+	}{
+		{streamResponses, "data: {\"type\":\"response.in_progress\"}\n\n"},
+		{streamChat, ": keepalive\n\n"},
+		{streamMessages, "event: ping\ndata: {\"type\":\"ping\"}\n\n"},
+	}
+	for _, tc := range cases {
+		if got := string(keepaliveFrame(tc.kind)); got != tc.want {
+			t.Fatalf("kind=%d keepalive=%q want=%q", tc.kind, got, tc.want)
+		}
+	}
+	errorCases := []struct {
 		kind streamKind
 		want string
 	}{
@@ -463,7 +473,7 @@ func TestExactSyntheticFrames(t *testing.T) {
 		{streamChat, "data: {\"error\":{\"message\":\"Upstream stream failed before completion.\",\"type\":\"stream_error\"}}\n\n"},
 		{streamMessages, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Upstream stream failed before completion.\"}}\n\n"},
 	}
-	for _, tc := range cases {
+	for _, tc := range errorCases {
 		if got := string(errorFrame(tc.kind)); got != tc.want {
 			t.Fatalf("kind=%d frame=%q want=%q", tc.kind, got, tc.want)
 		}
