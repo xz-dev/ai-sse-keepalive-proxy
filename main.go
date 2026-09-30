@@ -444,8 +444,9 @@ func (p *proxy) serveStream(w http.ResponseWriter, r *http.Request, kind streamK
 // downstream connection warm with 103 Early Hints interim responses whenever
 // the upstream stays silent longer than cfg.idle. Interim 1xx frames are the
 // only protocol-legal bytes a server may emit before a final non-stream
-// response; Cloudflare forwards all 1xx responses, nginx forwards 103 with
-// early_hints enabled, and httpx/aiohttp clients skip them transparently.
+// response; NGINX 1.29.0+ can forward 103 with early_hints enabled. Other
+// intermediaries may consume it (cloudflared 2026.9.3 does), so end-to-end
+// forwarding and deadline behavior must be verified separately.
 // Clients speaking HTTP/1.0 get plain passthrough because 1xx is undefined
 // there.
 func (p *proxy) serveNonStream(w http.ResponseWriter, r *http.Request) {
@@ -589,20 +590,33 @@ func (p *proxy) handleAfterThreshold(w http.ResponseWriter, r *http.Request, kin
 	lastWrite := time.Now()
 	timer := time.NewTimer(p.cfg.idle)
 	defer timer.Stop()
+	var errorFrames <-chan []byte
 	for {
 		select {
 		case got := <-result:
+			result = nil // The upstream response arrives only once.
 			if got.err != nil {
 				writeFrame(w, errorFrame(kind))
 				return
 			}
 			defer got.response.Body.Close()
 			if !validSSE(got.response) {
-				writeFrame(w, errorFrame(kind))
-				return
+				// Reading an error body must not block the downstream writer's
+				// heartbeat or cancellation handling. The buffered result lets
+				// the reader finish even if the client disconnects first.
+				frames := make(chan []byte, 1)
+				errorFrames = frames
+				go func() { frames <- clientErrorFrame(kind, got.response) }()
+				continue
 			}
 			remaining := p.cfg.idle - time.Since(lastWrite)
 			p.copySSEAfter(w, r, kind, streamReads(r.Context(), got.response.Body), remaining, newTerminalDetector(kind))
+			return
+		case frame := <-errorFrames:
+			if frame == nil {
+				frame = errorFrame(kind)
+			}
+			writeFrame(w, frame)
 			return
 		case <-timer.C:
 			if !writeFrame(w, keepaliveFrame(kind)) {
@@ -611,7 +625,9 @@ func (p *proxy) handleAfterThreshold(w http.ResponseWriter, r *http.Request, kin
 			lastWrite = time.Now()
 			timer.Reset(p.cfg.idle)
 		case <-r.Context().Done():
-			drainResult(result)
+			if result != nil {
+				drainResult(result)
+			}
 			return
 		}
 	}
@@ -827,6 +843,91 @@ func errorFrame(kind streamKind) []byte {
 	default:
 		return nil
 	}
+}
+
+// passthroughStatuses are the approved late-error disclosure boundary:
+// sub2api's client-error passthrough set, plus 429 for quota/rate limits.
+// 401/403 stay hidden because they describe gateway-internal credentials.
+var passthroughStatuses = map[int]bool{400: true, 404: true, 409: true, 422: true, 429: true}
+
+const maxErrorBodyBytes = 64 << 10
+
+// clientErrorFrame extracts only message and optional string code/type from a
+// complete, bounded JSON error. Everything else keeps the generic frame.
+func clientErrorFrame(kind streamKind, resp *http.Response) []byte {
+	encoding := strings.TrimSpace(resp.Header.Get("Content-Encoding"))
+	if !passthroughStatuses[resp.StatusCode] || !isJSON(resp.Header.Get("Content-Type")) ||
+		(encoding != "" && !strings.EqualFold(encoding, "identity")) || resp.ContentLength > maxErrorBodyBytes {
+		return nil
+	}
+	// Read one extra byte so an artificial LimitReader EOF cannot turn a
+	// truncated prefix into an apparently complete JSON document.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes+1))
+	if err != nil || len(body) > maxErrorBodyBytes {
+		return nil
+	}
+	var env map[string]json.RawMessage
+	if json.Unmarshal(body, &env) != nil {
+		return nil
+	}
+	var details map[string]json.RawMessage
+	_ = json.Unmarshal(env["error"], &details)
+	var message, errType, upstreamCode string
+	_ = json.Unmarshal(details["message"], &message)
+	if message == "" {
+		_ = json.Unmarshal(env["message"], &message)
+	}
+	if message == "" {
+		return nil
+	}
+	_ = json.Unmarshal(details["type"], &errType)
+	_ = json.Unmarshal(details["code"], &upstreamCode)
+	code := fmt.Sprintf("http_%d", resp.StatusCode)
+	if upstreamCode != "" {
+		code = upstreamCode
+	}
+	if errType == "" {
+		errType = "invalid_request_error"
+	}
+	// Structs (not maps) keep field order identical to errorFrame's shapes.
+	var event any
+	switch kind {
+	case streamResponses:
+		event = struct {
+			Type    string  `json:"type"`
+			Code    string  `json:"code"`
+			Message string  `json:"message"`
+			Param   *string `json:"param"`
+		}{"error", code, message, nil}
+	case streamChat:
+		type chatError struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+		}
+		event = struct {
+			Error chatError `json:"error"`
+		}{chatError{message, errType, code}}
+	case streamMessages:
+		type messagesError struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		}
+		event = struct {
+			Type  string        `json:"type"`
+			Error messagesError `json:"error"`
+		}{"error", messagesError{errType, message}}
+	default:
+		return nil
+	}
+	data, err := json.Marshal(event)
+	if err != nil {
+		return nil
+	}
+	if kind == streamMessages {
+		return []byte("event: error\ndata: " + string(data) + "\n\n")
+	}
+	return []byte("data: " + string(data) + "\n\n")
 }
 
 func resetTimer(timer *time.Timer, d time.Duration) {

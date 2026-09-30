@@ -306,6 +306,172 @@ func TestSlowUpstreamFailuresAreGenericInBand(t *testing.T) {
 	}
 }
 
+func TestSlowUpstreamClientErrorsCarryRealReasonInBand(t *testing.T) {
+	const reason = "You have insufficient credits to make this request."
+	for _, tc := range []struct {
+		name   string
+		path   string
+		status int
+		body   string
+		want   string
+	}{
+		{"responses 400 openai shape", "/v1/responses", 400,
+			`{"error":{"message":"` + reason + `","type":"invalid_request_error","code":"insufficient_quota"}}`,
+			`data: {"type":"error","code":"insufficient_quota","message":"` + reason + `","param":null}` + "\n\n"},
+		{"responses 429 top-level message", "/v1/responses", 429,
+			`{"message":"` + reason + `"}`,
+			`data: {"type":"error","code":"http_429","message":"` + reason + `","param":null}` + "\n\n"},
+		{"chat 404", "/v1/chat/completions", 404,
+			`{"error":{"message":"` + reason + `","type":"not_found_error"}}`,
+			`data: {"error":{"message":"` + reason + `","type":"not_found_error","code":"http_404"}}` + "\n\n"},
+		{"messages 422 anthropic shape", "/v1/messages", 422,
+			`{"type":"error","error":{"type":"invalid_request_error","message":"` + reason + `"}}`,
+			"event: error\ndata: " + `{"type":"error","error":{"type":"invalid_request_error","message":"` + reason + `"}}` + "\n\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, _ := testProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				time.Sleep(25 * time.Millisecond)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, tc.body)
+			}), 5*time.Millisecond, time.Second, defaultMaxBody)
+			resp := request(t, http.DefaultClient, http.MethodPost, p.URL+tc.path, "application/json", `{"stream":true}`)
+			body := readAll(t, resp)
+			if resp.StatusCode != 200 || !strings.HasSuffix(body, tc.want) {
+				t.Fatalf("status=%d body=%q\nwant suffix %q", resp.StatusCode, body, tc.want)
+			}
+		})
+	}
+}
+
+func TestSlowUpstreamInternalErrorsStayGeneric(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		status      int
+		contentType string
+		body        string
+	}{
+		{"401 credential", 401, "application/json", `{"error":{"message":"SECRET bad key"}}`},
+		{"403 credential", 403, "application/json", `{"error":{"message":"SECRET forbidden"}}`},
+		{"500 upstream", 500, "application/json", `{"error":{"message":"SECRET internal"}}`},
+		{"400 non-json", 400, "text/plain", "SECRET plain"},
+		{"400 json without message", 400, "application/json", `{"error":{"code":"SECRET"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, _ := testProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				time.Sleep(25 * time.Millisecond)
+				w.Header().Set("Content-Type", tc.contentType)
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, tc.body)
+			}), 5*time.Millisecond, time.Second, defaultMaxBody)
+			resp := request(t, http.DefaultClient, http.MethodPost, p.URL+"/v1/responses", "application/json", `{"stream":true}`)
+			body := readAll(t, resp)
+			if resp.StatusCode != 200 || !strings.HasSuffix(body, string(errorFrame(streamResponses))) || strings.Contains(body, "SECRET") {
+				t.Fatalf("status=%d body=%q", resp.StatusCode, body)
+			}
+		})
+	}
+}
+
+func TestLateClientErrorBodyKeepsHeartbeatsAndCancels(t *testing.T) {
+	releaseHeaders := make(chan struct{})
+	releaseBody := make(chan struct{})
+	headersReady := make(chan struct{})
+	cancelled := make(chan struct{})
+	p, _ := testProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-releaseHeaders
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(400)
+		w.(http.Flusher).Flush()
+		close(headersReady)
+		select {
+		case <-releaseBody:
+			_, _ = io.WriteString(w, `{"message":"late reason"}`)
+		case <-r.Context().Done():
+			close(cancelled)
+		}
+	}), 5*time.Millisecond, 10*time.Millisecond, defaultMaxBody)
+	defer close(releaseBody)
+	resp := request(t, http.DefaultClient, http.MethodPost, p.URL+"/v1/responses", "application/json", `{"stream":true}`)
+	defer resp.Body.Close()
+	frames := make(chan string, 32)
+	go func() {
+		defer close(frames)
+		scanner := bufio.NewScanner(resp.Body)
+		for scanner.Scan() {
+			if scanner.Text() != "" {
+				frames <- scanner.Text()
+			}
+		}
+	}()
+	<-frames // Startup frame commits HTTP 200 before upstream headers.
+	close(releaseHeaders)
+	<-headersReady
+	deadline := time.NewTimer(250 * time.Millisecond)
+	defer deadline.Stop()
+	for count := 0; count < 3; {
+		select {
+		case frame, ok := <-frames:
+			if !ok || frame != `data: {"type":"response.in_progress"}` {
+				t.Fatalf("unexpected frame while error body stalled: %q", frame)
+			}
+			count++
+		case <-deadline.C:
+			t.Fatal("SSE heartbeats stopped while reading late error body")
+		}
+	}
+	_ = resp.Body.Close()
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("client cancellation did not cancel the upstream body read")
+	}
+}
+
+func TestLateClientErrorBodyValidation(t *testing.T) {
+	prefix := `{"message":"visible reason"}`
+	padded := prefix + strings.Repeat(" ", maxErrorBodyBytes-len(prefix))
+	for _, tc := range []struct {
+		name     string
+		body     string
+		encoding string
+		want     bool
+	}{
+		{"exact cap", padded, "", true},
+		{"overflow after valid prefix", padded + "NOT JSON", "", false},
+		{"top-level message and string error", `{"message":"visible reason","error":"description"}`, "", true},
+		{"nested message and numeric type", `{"error":{"message":"visible reason","type":123,"code":{}}}`, "", true},
+		{"nested message and numeric top-level message", `{"message":123,"error":{"message":"visible reason"}}`, "", true},
+		{"compressed response not decoded", prefix, "gzip", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := &http.Response{StatusCode: 409, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(tc.body)), ContentLength: -1}
+			resp.Header.Set("Content-Encoding", tc.encoding)
+			frame := clientErrorFrame(streamResponses, resp)
+			if got := strings.Contains(string(frame), `"message":"visible reason"`); got != tc.want {
+				t.Fatalf("message exposed=%v, want=%v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestLateClientErrorIncompleteBodyStaysGeneric(t *testing.T) {
+	prefix := `{"message":"must not be exposed"}`
+	body := prefix + strings.Repeat(" ", maxErrorBodyBytes-len(prefix))
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", fmt.Sprint(maxErrorBodyBytes+100))
+		w.WriteHeader(400)
+		_, _ = io.WriteString(w, body)
+	}))
+	defer upstream.Close()
+	resp := request(t, http.DefaultClient, http.MethodGet, upstream.URL, "", "")
+	defer resp.Body.Close()
+	if frame := clientErrorFrame(streamResponses, resp); frame != nil {
+		t.Fatalf("incomplete response exposed details: %q", frame)
+	}
+}
+
 func TestFastInvalidResponsePreserved(t *testing.T) {
 	p, _ := testProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
