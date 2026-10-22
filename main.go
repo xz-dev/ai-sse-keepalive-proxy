@@ -370,12 +370,20 @@ func (p *proxy) inspect(r *http.Request) (streamKind, []byte, inspectMode) {
 	_ = r.Body.Close()
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	var envelope struct {
-		Stream *bool `json:"stream"`
+		Stream     *bool           `json:"stream"`
+		Background json.RawMessage `json:"background"`
 	}
 	if json.Unmarshal(body, &envelope) != nil {
 		return streamNone, nil, modePassThrough
 	}
 	if envelope.Stream != nil && *envelope.Stream {
+		// Background responses carry the standard resume contract: an early
+		// 200 or a synthetic response.in_progress would consume the client's
+		// cursor before the real task exists (design D7). Only an exact JSON
+		// boolean true opts in; other values keep foreground behavior.
+		if kind == streamResponses && string(bytes.TrimSpace(envelope.Background)) == "true" {
+			return streamNone, nil, modePassThrough
+		}
 		return kind, body, modeStream
 	}
 	return kind, body, modeNonStream

@@ -14,7 +14,7 @@ Plain APISIX/Nginx body filters run only when upstream sends body data, so they 
 
 ## Behavior
 
-Only exact JSON `POST` requests with explicit boolean `"stream": true` are inspected for SSE keepalive:
+Only exact JSON `POST` requests with explicit boolean `"stream": true` are inspected for SSE keepalive. Exception: Responses-path requests that also carry exact boolean `"background": true` skip the keepalive path entirely and are proxied transparently (no early 200, no synthetic `response.in_progress`) so the standard resume contract's real status, headers, and body reach the client unchanged (see openspec design D7):
 
 | Path | Protocol-visible keepalive | Terminal events |
 |---|---|---|

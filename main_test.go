@@ -832,6 +832,201 @@ func TestRouteParsersAndGate(t *testing.T) {
 	}
 }
 
+func TestBackgroundStreamDelayedUpstreamErrorStaysRealHTTP(t *testing.T) {
+	for _, path := range []string{"/v1/responses", "/backend-api/codex/responses"} {
+		t.Run(path, func(t *testing.T) {
+			const errBody = `{"error":{"message":"insufficient credits","type":"invalid_request_error","code":"insufficient_quota"}}`
+			p, _ := testProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				time.Sleep(40 * time.Millisecond) // silent past HEADER_WAIT below
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("X-Upstream-Reason", "kept")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = io.WriteString(w, errBody)
+			}), 5*time.Millisecond, time.Second, defaultMaxBody)
+			resp := request(t, http.DefaultClient, http.MethodPost, p.URL+path, "application/json", `{"stream":true,"background":true}`)
+			got := readAll(t, resp)
+			if resp.StatusCode != http.StatusTooManyRequests || resp.Header.Get("X-Upstream-Reason") != "kept" || got != errBody {
+				t.Fatalf("status=%d header=%q body=%q", resp.StatusCode, resp.Header.Get("X-Upstream-Reason"), got)
+			}
+		})
+	}
+}
+
+func TestBackgroundStreamSilentSuccessHasNoSyntheticFrames(t *testing.T) {
+	const frame1 = "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_bg1\"}}\n\n"
+	const frame2 = "data: {\"type\":\"response.completed\"}\n\n"
+	release := make(chan struct{})
+	p, _ := testProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(40 * time.Millisecond) // silent past HEADER_WAIT below
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, frame1)
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		_, _ = io.WriteString(w, frame2)
+	}), 5*time.Millisecond, time.Second, defaultMaxBody)
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+	resp := request(t, http.DefaultClient, http.MethodPost, p.URL+"/v1/responses", "application/json", `{"stream":true,"background":true}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "text/event-stream" {
+		t.Fatalf("status=%d content-type=%q", resp.StatusCode, resp.Header.Get("Content-Type"))
+	}
+	first := make(chan string, 1)
+	go func() {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, int64(len(frame1))))
+		first <- string(data)
+	}()
+	select {
+	case got := <-first:
+		if got != frame1 {
+			t.Fatalf("first frame=%q want %q", got, frame1)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no real upstream frame arrived")
+	}
+	select {
+	case <-release:
+		t.Fatal("first frame arrived only after upstream finished")
+	default:
+	}
+	close(release)
+	released = true
+	rest, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := frame1 + string(rest); got != frame1+frame2 || strings.Contains(got, "response.in_progress") {
+		t.Fatalf("body=%q", got)
+	}
+}
+
+func TestKeepaliveExceptionClassificationIsExact(t *testing.T) {
+	t.Run("foreground responses startup frame remains", func(t *testing.T) {
+		p, _ := testProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			time.Sleep(40 * time.Millisecond)
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: real\n\n")
+		}), 5*time.Millisecond, time.Second, defaultMaxBody)
+		resp := request(t, http.DefaultClient, http.MethodPost, p.URL+"/v1/responses", "application/json", `{"stream":true}`)
+		body := readAll(t, resp)
+		if resp.StatusCode != 200 || !strings.Contains(body, `data: {"type":"response.in_progress"}`) || !strings.Contains(body, "data: real") {
+			t.Fatalf("status=%d body=%q", resp.StatusCode, body)
+		}
+	})
+	t.Run("string background value stays foreground", func(t *testing.T) {
+		const reason = "insufficient credits"
+		p, _ := testProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			time.Sleep(40 * time.Millisecond)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"error":{"message":"`+reason+`"}}`)
+		}), 5*time.Millisecond, time.Second, defaultMaxBody)
+		resp := request(t, http.DefaultClient, http.MethodPost, p.URL+"/v1/responses", "application/json", `{"stream":true,"background":"true"}`)
+		body := readAll(t, resp)
+		if resp.StatusCode != 200 || !strings.Contains(body, reason) || !strings.Contains(body, `"type":"error"`) {
+			t.Fatalf("status=%d body=%q", resp.StatusCode, body)
+		}
+	})
+	t.Run("chat background stream keeps keepalive", func(t *testing.T) {
+		p, _ := testProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			time.Sleep(40 * time.Millisecond)
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: real\n\n")
+		}), 5*time.Millisecond, time.Second, defaultMaxBody)
+		resp := request(t, http.DefaultClient, http.MethodPost, p.URL+"/v1/chat/completions", "application/json", `{"stream":true,"background":true}`)
+		body := readAll(t, resp)
+		if resp.StatusCode != 200 || !strings.Contains(body, ": keepalive") || !strings.Contains(body, "data: real") {
+			t.Fatalf("status=%d body=%q", resp.StatusCode, body)
+		}
+	})
+	t.Run("background non-stream keeps final response", func(t *testing.T) {
+		p, _ := testProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			time.Sleep(40 * time.Millisecond)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(207)
+			_, _ = io.WriteString(w, `{"ok":true}`)
+		}), 5*time.Millisecond, 10*time.Millisecond, defaultMaxBody)
+		resp := request(t, http.DefaultClient, http.MethodPost, p.URL+"/v1/responses", "application/json", `{"stream":false,"background":true}`)
+		if resp.StatusCode != 207 || readAll(t, resp) != `{"ok":true}` {
+			t.Fatalf("status=%d", resp.StatusCode)
+		}
+	})
+}
+
+func TestStandardResumeGetAndCancelStayTransparent(t *testing.T) {
+	type upstreamCall struct {
+		method, path, query string
+	}
+	calls := make(chan upstreamCall, 4)
+	p, _ := testProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls <- upstreamCall{r.Method, r.URL.Path, r.URL.RawQuery}
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: {\"type\":\"response.created\"}\n\ndata: {\"type\":\"response.completed\"}\n\n")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"status":"cancelled"}`)
+	}), time.Second, time.Second, defaultMaxBody)
+
+	t.Run("resume GET keeps exact path and query", func(t *testing.T) {
+		resp := request(t, http.DefaultClient, http.MethodGet, p.URL+"/v1/responses/resp_bg1?stream=true&starting_after=17", "", "")
+		body := readAll(t, resp)
+		call := <-calls
+		if call.method != http.MethodGet || call.path != "/v1/responses/resp_bg1" || call.query != "stream=true&starting_after=17" {
+			t.Fatalf("upstream saw %+v", call)
+		}
+		want := "data: {\"type\":\"response.created\"}\n\ndata: {\"type\":\"response.completed\"}\n\n"
+		if resp.StatusCode != 200 || body != want || strings.Contains(body, "response.in_progress") {
+			t.Fatalf("status=%d body=%q", resp.StatusCode, body)
+		}
+	})
+	t.Run("cancel POST stays transparent", func(t *testing.T) {
+		resp := request(t, http.DefaultClient, http.MethodPost, p.URL+"/v1/responses/resp_bg1/cancel", "application/json", `{}`)
+		body := readAll(t, resp)
+		call := <-calls
+		if call.method != http.MethodPost || call.path != "/v1/responses/resp_bg1/cancel" {
+			t.Fatalf("upstream saw %+v", call)
+		}
+		if resp.StatusCode != 200 || body != `{"status":"cancelled"}` {
+			t.Fatalf("status=%d body=%q", resp.StatusCode, body)
+		}
+	})
+}
+
+func TestResumeGetClientCancelReachesUpstream(t *testing.T) {
+	cancelled := make(chan struct{})
+	p, _ := testProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+		close(cancelled)
+	}), time.Second, time.Second, defaultMaxBody)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, p.URL+"/v1/responses/resp_bg1?stream=true&starting_after=3", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	resp.Body.Close()
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("client cancellation did not reach upstream")
+	}
+}
+
 func TestWebSocketStyleUpgradePassThrough(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.EqualFold(r.Header.Get("Upgrade"), "testproto") {
