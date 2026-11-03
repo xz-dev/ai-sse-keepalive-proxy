@@ -38,7 +38,6 @@ type config struct {
 	requireNoDefaultRoute bool
 	wsPingInterval        time.Duration
 	wsPingTimeout         time.Duration
-	wsWriteTimeout        time.Duration
 	wsHandshakeTimeout    time.Duration
 }
 
@@ -195,10 +194,6 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
-	wsWriteTimeout, err := envDuration("WS_WRITE_TIMEOUT", 120*time.Second)
-	if err != nil {
-		return config{}, err
-	}
 	wsHandshakeTimeout, err := envDuration("WS_HANDSHAKE_TIMEOUT", 10*time.Second)
 	if err != nil {
 		return config{}, err
@@ -210,7 +205,7 @@ func loadConfig() (config, error) {
 		upstream: u, listen: listen, wait: wait, idle: idle, maxBody: maxBody,
 		requireNoDefaultRoute: requireNoDefaultRoute,
 		wsPingInterval:        wsPingInterval, wsPingTimeout: wsPingTimeout,
-		wsWriteTimeout: wsWriteTimeout, wsHandshakeTimeout: wsHandshakeTimeout,
+		wsHandshakeTimeout: wsHandshakeTimeout,
 	}, nil
 }
 

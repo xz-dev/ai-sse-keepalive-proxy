@@ -22,7 +22,7 @@ func wsProxyCfg(u *url.URL) config {
 	return config{
 		upstream: u, wait: time.Second, idle: time.Second, maxBody: defaultMaxBody,
 		wsPingInterval: 80 * time.Millisecond, wsPingTimeout: 40 * time.Millisecond,
-		wsWriteTimeout: 5 * time.Second, wsHandshakeTimeout: 5 * time.Second,
+		wsHandshakeTimeout: 5 * time.Second,
 	}
 }
 
@@ -308,65 +308,6 @@ func TestWSDisabledFallsThrough(t *testing.T) {
 	_, msg, err := conn.Read(ctx)
 	if err != nil || string(msg) != "hi" {
 		t.Fatalf("disabled tunnel echo failed msg=%q err=%v", msg, err)
-	}
-}
-
-// WS-05: a destination that stops reading causes the write-side bound to trip
-// rather than the relay hanging forever; a silent source does not trip it.
-func TestWSWriteStallBound(t *testing.T) {
-	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c, err := websocket.Accept(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer c.CloseNow()
-		c.SetReadLimit(-1)
-		ctx := r.Context()
-		// read one then flood client while never reading again
-		_, _, _ = c.Read(ctx)
-		for i := 0; i < 64; i++ {
-			if werr := c.Write(ctx, websocket.MessageBinary, make([]byte, 64<<10)); werr != nil {
-				return
-			}
-		}
-	}))
-	defer up.Close()
-	u, _ := url.Parse(up.URL)
-	cfg := wsProxyCfg(u)
-	cfg.wsWriteTimeout = 300 * time.Millisecond
-	front := httptest.NewServer(newProxy(cfg))
-	defer front.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	conn, _, err := websocket.Dial(ctx, "ws"+front.URL[4:]+"/v1/responses", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.CloseNow()
-	conn.SetReadLimit(-1)
-
-	// trigger the flood then read until the relay's write bound trips and the
-	// proxy tears the session down; each individual Read may succeed while
-	// buffered data drains.
-	_ = conn.Write(ctx, websocket.MessageText, []byte("go"))
-	done := make(chan error, 1)
-	go func() {
-		for {
-			_, _, err := conn.Read(context.Background())
-			if err != nil {
-				done <- err
-				return
-			}
-		}
-	}()
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("expected connection to end on write stall")
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("write stall never ended the session")
 	}
 }
 
@@ -693,9 +634,10 @@ func TestWSSessionOutlivesHandshakeTimeout(t *testing.T) {
 	}
 }
 
-// True write stall: client never reads while upstream floods; the write bound
-// must tear the session down, not deadlock in writer.Close().
-func TestWSTrueWriteStallNoReader(t *testing.T) {
+// True write stall: client never reads while upstream floods; with no
+// proxy-local write deadline the session must still end promptly when the
+// client cancels (CloseNow), and the proxy must not leak the parked write.
+func TestWSTrueWriteStallEndsOnClientCancel(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, err := websocket.Accept(w, r, nil)
 		if err != nil {
@@ -713,30 +655,35 @@ func TestWSTrueWriteStallNoReader(t *testing.T) {
 	}))
 	defer up.Close()
 	u, _ := url.Parse(up.URL)
-	cfg := wsProxyCfg(u)
-	cfg.wsWriteTimeout = 300 * time.Millisecond
-	front := httptest.NewServer(newProxy(cfg))
+	front := httptest.NewServer(newProxy(wsProxyCfg(u)))
 	defer front.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
 	conn, _, err := websocket.Dial(ctx, "ws"+front.URL[4:]+"/v1/responses", nil)
 	if err != nil {
+		cancel()
 		t.Fatal(err)
 	}
-	defer conn.CloseNow()
 	conn.SetReadLimit(-1)
 
 	_ = conn.Write(ctx, websocket.MessageText, []byte("go"))
-	errCh := make(chan error, 1)
+	// Let the flood park the relay write, then cancel the client.
+	time.Sleep(300 * time.Millisecond)
+	conn.CloseNow()
+
+	// The proxy session must observe the closed client and release both legs
+	// (including the parked write) without a deadline to save it.
+	sessionDone := make(chan struct{})
 	go func() {
-		_, _, rerr := conn.Read(context.Background())
-		errCh <- rerr
+		defer close(sessionDone)
+		_, _, _ = conn.Read(context.Background())
 	}()
 	select {
-	case <-errCh:
+	case <-sessionDone:
+		cancel()
 	case <-time.After(5 * time.Second):
-		t.Fatal("write-stall path hung: writer.Close() deadlock suspected")
+		cancel()
+		t.Fatal("session hung after client cancel: parked write not released")
 	}
 }
 

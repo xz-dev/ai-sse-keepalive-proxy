@@ -223,12 +223,12 @@ func (p *proxy) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		s.relay(p.cfg, clientConn, upConn) // client -> upstream
-		s.terminate()                      // first leg to end tears down the pair
+		s.relay(clientConn, upConn) // client -> upstream
+		s.terminate()               // first leg to end tears down the pair
 	}()
 	go func() {
 		defer wg.Done()
-		end := s.relay(p.cfg, upConn, clientConn) // upstream -> client
+		end := s.relay(upConn, clientConn) // upstream -> client
 		s.terminateWith(end)
 	}()
 	go s.heartbeat(p.cfg)
@@ -244,7 +244,10 @@ type relayEnd struct {
 	clean bool                 // true when src ended with a close frame
 }
 
-func (s *wsSession) relay(cfg config, src, dst *websocket.Conn) relayEnd {
+func (s *wsSession) relay(src, dst *websocket.Conn) relayEnd {
+	// No proxy-local write deadline: a blocked destination parks in Copy
+	// (bounded buffer) until the peer reads, errors, or the session is
+	// terminated; lifecycle belongs to the peers and cancellation.
 	buf := make([]byte, wsCopyBufferSize)
 	for {
 		typ, reader, err := src.Reader(context.Background())
@@ -259,12 +262,11 @@ func (s *wsSession) relay(cfg config, src, dst *websocket.Conn) relayEnd {
 		if err != nil {
 			return relayEnd{clean: false}
 		}
-		n, copyErr := io.CopyBuffer(&wsWriteTimeoutWriter{w: writer, timeout: cfg.wsWriteTimeout}, reader, buf)
+		n, copyErr := io.CopyBuffer(writer, reader, buf)
 		if copyErr != nil {
-			// A failed copy (e.g. write-stall timeout) leaves the destination
-			// writer's internal lock held by the abandoned Write goroutine; calling
-			// writer.Close() here would deadlock. Bail and let terminate() force
-			// the underlying connection, which releases it.
+			// The destination failed or the session was terminated; the writer
+			// is abandoned without Close (its mutex may be held by the failed
+			// Write) and terminate() force-closes the underlying connection.
 			return relayEnd{clean: false}
 		}
 		if err := writer.Close(); err != nil {
@@ -275,34 +277,6 @@ func (s *wsSession) relay(cfg config, src, dst *websocket.Conn) relayEnd {
 		if dst == s.client {
 			s.lastDownWrite.Store(time.Now().UnixNano())
 		}
-	}
-}
-
-// wsWriteTimeoutWriter bounds each blocked Write on the destination, not the
-// source-side wait for new data: a stalled peer trips the budget while a
-// legitimately fragmented or silent source does not.
-type wsWriteTimeoutWriter struct {
-	w       io.Writer
-	timeout time.Duration
-}
-
-func (t *wsWriteTimeoutWriter) Write(p []byte) (int, error) {
-	type result struct {
-		n   int
-		err error
-	}
-	ch := make(chan result, 1)
-	go func() {
-		n, err := t.w.Write(p)
-		ch <- result{n, err}
-	}()
-	timer := time.NewTimer(t.timeout)
-	defer timer.Stop()
-	select {
-	case r := <-ch:
-		return r.n, r.err
-	case <-timer.C:
-		return 0, errors.New("websocket destination write timed out")
 	}
 }
 

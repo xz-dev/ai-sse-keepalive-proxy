@@ -1,0 +1,149 @@
+name: publish-maintenance-transparent-ws-write
+
+# One-shot publication of the transparent WS-write maintenance slice.
+# Triggers only on the owned maintenance branch; no tag, release, PR or
+# default-branch publication path. The existing ci.yml is untouched.
+
+on:
+  push:
+    branches:
+      - maintenance/transparent-ws-write
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-maintenance-transparent-ws-write-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/ai-sse-keepalive-proxy
+
+jobs:
+  tests:
+    name: Full test suite (unskipped)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Verify source scope against baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline="1c489390927a986b7aacd3ebdfef3ea33f51d15d"
+          if git cat-file -e "${baseline}^{commit}" 2>/dev/null; then
+            base_for_diff="$baseline"
+          else
+            git fetch --no-tags origin "${baseline}"
+            base_for_diff="FETCH_HEAD"
+          fi
+          changed=$(git diff --name-only "${base_for_diff}"..HEAD | sort)
+          expected=$(printf '%s\n' \
+            README.md \
+            backpressure_test.go \
+            controlled_backpressure_test.go \
+            main.go \
+            websocket.go \
+            websocket_test.go \
+            .github/workflows/publish-maintenance-transparent-ws-write.yml \
+            ops/scripts/ci/immutable-tag-guard.sh \
+            ops/scripts/ci/test-immutable-tag-guard.sh | sort)
+          test "$changed" = "$expected"
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+      - name: go vet
+        run: go vet ./...
+      - name: Full test suite with race (unchanged, unskipped)
+        run: go test -race ./... -count=1
+      - name: Immutable-tag guard unit tests
+        run: bash ops/scripts/ci/test-immutable-tag-guard.sh
+
+  image:
+    name: Build and publish linux/amd64 image
+    runs-on: ubuntu-latest
+    needs: [tests]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Resolve immutable tag
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "tag=${IMAGE_NAME}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+      - name: Refuse to overwrite an existing tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash ops/scripts/ci/immutable-tag-guard.sh "${{ steps.image.outputs.tag }}"
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ${{ steps.image.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+      - name: Validate published digest
+        id: published
+        env:
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$BUILD_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "ref=${IMAGE_NAME}@${BUILD_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Published ${IMAGE_NAME}:${{ github.sha }}@${BUILD_DIGEST} from ${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+      - name: Verify published image runtime contract
+        env:
+          PUBLISHED_REF: ${{ steps.published.outputs.ref }}
+          SOURCE_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="$PUBLISHED_REF"
+          docker pull "$ref"
+          test "$(docker image inspect "$ref" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$SOURCE_SHA"
+          test "$(docker image inspect "$ref" --format '{{json .Config.User}}')" = '"65534:65534"'
+          test "$(docker image inspect "$ref" --format '{{json .Config.Entrypoint}}')" = '["/ai-sse-keepalive-proxy"]'
+          docker run --rm --network none --read-only --cap-drop ALL --memory 160m --memory-swap 160m \
+            -e UPSTREAM_URL=http://127.0.0.1:9 \
+            -e LISTEN_ADDR=127.0.0.1:8080 \
+            -e WS_PING_INTERVAL=15s \
+            -e WS_PING_TIMEOUT=5s \
+            -e GOMEMLIMIT=96MiB \
+            --name sse-transparent-smoke \
+            -d "$ref"
+          trap 'docker logs sse-transparent-smoke; docker rm -f sse-transparent-smoke' EXIT
+          for attempt in $(seq 1 30); do
+            if docker exec sse-transparent-smoke /ai-sse-keepalive-proxy healthcheck; then exit 0; fi
+            sleep 2
+          done
+          exit 1
